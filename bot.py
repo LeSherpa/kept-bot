@@ -956,6 +956,27 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# DEV ONLY - remove before launch
+async def cmd_testunsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.username != "geopardi":
+        return
+    pair = get_user_pair(update.effective_user.id)
+    if not pair:
+        await update.message.reply_text("No pair found.")
+        return
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE pairs SET subscription_tier = 'free', pending_upgrade_at = NULL WHERE id = %s",
+                (pair["id"],),
+            )
+        conn.commit()
+    finally:
+        release_db(conn)
+    await update.message.reply_text("Done. Back to free. Go test /subscribe again.")
+
+
 async def cmd_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Kept Plus is a monthly subscription at €3.99.\n"
@@ -1132,6 +1153,7 @@ def _build_tg_app() -> Application:
     app.add_handler(CommandHandler("react", cmd_react))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("terms", cmd_terms))
+    app.add_handler(CommandHandler("testunsubscribe", cmd_testunsubscribe))  # DEV ONLY
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal_"))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm_"))
