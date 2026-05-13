@@ -546,7 +546,8 @@ async def deliver_surprise(chat_id: int, surprise, bot: Bot):
     media_type = surprise["media_type"]
     file_id = surprise.get("file_id")
     caption = surprise.get("caption") or ""
-    intro = "Something arrived for you."
+    sender = surprise.get("creator_name") or "Someone"
+    intro = f"{sender} left this for you. 💌"
 
     if media_type == "text":
         await bot.send_message(chat_id, f"{intro}\n\n{surprise['text_content']}")
@@ -1324,9 +1325,10 @@ async def daily_check(bot: Bot):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT DISTINCT pm.user_id
+                SELECT DISTINCT pm.user_id, u.first_name AS sender_name
                 FROM pair_members pm
                 JOIN surprises s ON s.pair_id = pm.pair_id
+                JOIN users u ON u.user_id = s.creator_id
                 WHERE s.scheduled_date = %s
                   AND s.creator_id != pm.user_id
                   AND s.is_opened = FALSE
@@ -1340,9 +1342,10 @@ async def daily_check(bot: Bot):
 
     for r in recipients:
         try:
+            sender = r["sender_name"] or "Someone"
             await bot.send_message(
                 r["user_id"],
-                "Something arrived for you today. Use /open when you're ready.",
+                f"{sender} left something for you. Use /open when you're ready.",
             )
         except Exception as e:
             logger.error(f"Failed to notify {r['user_id']}: {e}")
