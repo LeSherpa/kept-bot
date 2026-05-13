@@ -707,7 +707,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             members = get_pair_members(pair_id, exclude_user=user.id)
             inviter_name = members[0]["first_name"] if members else "someone"
             await update.message.reply_text(
-                f"You've joined {inviter_name}'s space. I'm Margot.\n\n"
+                f"You've joined {inviter_name}'s Kept. I'm Margot.\n\n"
                 "I hold things here until the right moment. "
                 "Use /load to leave something."
             )
@@ -739,7 +739,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Oh, you found me. Good.\n\n"
         "I'm Margot. I keep things safe until the moment is right.\n\n"
-        "Use /invite to bring someone into your space, "
+        "Use /invite to bring someone into your Kept, "
         "then /load to leave them something.\n\n"
         "When your partner joins, you'll both get 7 days of Plus free. 🔑"
     )
@@ -1197,28 +1197,44 @@ async def cmd_testtrial(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         (pair["id"],),
                     )
                     conn.commit()
-                    await update.message.reply_text("Trial started. trial_started_at = NOW().")
+                    await update.message.reply_text("Trial started. 7 days of Plus from now. 🔑")
                 elif sub == "expire":
                     cur.execute(
                         "UPDATE pairs SET trial_started_at = NOW() - INTERVAL '8 days', trial_notified = FALSE WHERE id = %s",
                         (pair["id"],),
                     )
                     conn.commit()
-                    await update.message.reply_text("Trial force-expired. trial_started_at = 8 days ago.")
+                    await update.message.reply_text("Trial expired. Kept is back to free tier.")
                 elif sub == "status":
                     cur.execute(
                         "SELECT subscription_tier, trial_started_at, trial_notified FROM pairs WHERE id = %s",
                         (pair["id"],),
                     )
                     row = cur.fetchone()
-                    active = is_plus_or_trial(row)
-                    days = trial_days_remaining(row) if active and row["trial_started_at"] else 0
+                    tier = row["subscription_tier"]
+                    trial_start = row["trial_started_at"]
+                    active_trial = is_plus_or_trial(row) and tier != "plus"
+                    if tier == "plus":
+                        plan = "Plus"
+                    elif active_trial:
+                        plan = "Plus trial"
+                    else:
+                        plan = "Free"
+                    started_str = friendly_date(trial_start.date()) if trial_start else "—"
+                    if trial_start and active_trial:
+                        days = trial_days_remaining(row)
+                        days_str = f"{days} {'day' if days == 1 else 'days'}"
+                    elif trial_start:
+                        days_str = "Expired"
+                    else:
+                        days_str = "Not applicable"
+                    subscription_str = "Active" if tier == "plus" else "None"
                     await update.message.reply_text(
-                        f"tier: {row['subscription_tier']}\n"
-                        f"trial_started_at: {row['trial_started_at']}\n"
-                        f"trial_notified: {row['trial_notified']}\n"
-                        f"is_plus_or_trial: {active}\n"
-                        f"days_remaining: {days}"
+                        f"Trial status.\n\n"
+                        f"Plan: {plan}\n"
+                        f"Trial started: {started_str}\n"
+                        f"Days remaining: {days_str}\n"
+                        f"Subscription: {subscription_str}"
                     )
                 else:
                     await update.message.reply_text("Usage: /testtrial start|expire|status")
@@ -1314,7 +1330,7 @@ async def cmd_testopenreceiver(update: Update, context: ContextTypes.DEFAULT_TYP
 async def cmd_devhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Dev commands.\n\n"
-        "/testinvite <1-3> — add fake members to your space\n"
+        "/testinvite <1-3> — add fake members to your Kept\n"
         "/testclearinvites — remove all fake members\n"
         "/testunsubscribe — reset pair back to free tier\n"
         "/testtrial start — start 7-day trial now\n"
@@ -1343,7 +1359,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/calendar — See what's waiting for you\n"
         "/outbox — See what you've prepared\n"
         "/react — React to a surprise\n"
-        "/invite — Invite someone to your space\n"
+        "/invite — Invite someone to your Kept\n"
         "/subscribe — Unlock Plus features\n"
         "/terms — Subscription terms\n\n"
         "That's everything. I'll be here."
@@ -1605,7 +1621,7 @@ async def _run() -> None:
         BotCommand("open", "Open today's surprise"),
         BotCommand("calendar", "See what's waiting for you"),
         BotCommand("outbox", "See what you've prepared"),
-        BotCommand("invite", "Invite someone to your space"),
+        BotCommand("invite", "Invite someone to your Kept"),
         BotCommand("react", "React to a surprise"),
         BotCommand("subscribe", "Unlock Plus features"),
         BotCommand("terms", "Subscription terms"),
