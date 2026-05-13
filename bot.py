@@ -1,15 +1,20 @@
+import asyncio
 import os
 import logging
 import platform
+import signal
 import time
 import traceback
 import uuid
 from calendar import monthcalendar, month_name
 from datetime import date
+from urllib.parse import urlencode, urlparse, urlunparse
 
+import aiohttp.web
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
+import stripe
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -34,6 +39,8 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK", "https://buy.stripe.com/placeholder")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+PORT = int(os.getenv("PORT", "8080"))
 
 _pool: psycopg2.pool.SimpleConnectionPool | None = None
 
@@ -451,38 +458,6 @@ def get_last_opened_surprise_for_user(user_id: int):
         release_db(conn)
 
 
-def set_pending_upgrade(pair_id: int):
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE pairs SET pending_upgrade_at = NOW() WHERE id = %s",
-                (pair_id,),
-            )
-        conn.commit()
-    finally:
-        release_db(conn)
-
-
-def get_pending_upgrade_age_hours(pair_id: int) -> float | None:
-    """Returns hours since pending_upgrade_at was set, or None if not set."""
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT EXTRACT(EPOCH FROM (NOW() - pending_upgrade_at)) / 3600 AS hours
-                FROM pairs
-                WHERE id = %s AND pending_upgrade_at IS NOT NULL
-                """,
-                (pair_id,),
-            )
-            row = cur.fetchone()
-            return row["hours"] if row else None
-    finally:
-        release_db(conn)
-
-
 def upgrade_pair_to_plus(pair_id: int):
     conn = get_db()
     try:
@@ -494,6 +469,12 @@ def upgrade_pair_to_plus(pair_id: int):
         conn.commit()
     finally:
         release_db(conn)
+
+
+def payment_link_for_user(user_id: int) -> str:
+    parsed = urlparse(STRIPE_PAYMENT_LINK)
+    query = urlencode({"client_reference_id": user_id})
+    return urlunparse(parsed._replace(query=query))
 
 
 # ---------------------------------------------------------------------------
@@ -588,6 +569,74 @@ async def forward_reaction(creator_id: int, media_type: str, file_id: str | None
         await bot.send_video(creator_id, file_id)
     elif media_type == "video_note":
         await bot.send_video_note(creator_id, file_id)
+
+
+# ---------------------------------------------------------------------------
+# Stripe webhook
+# ---------------------------------------------------------------------------
+
+async def handle_stripe_webhook(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    raw_body = await request.read()
+    sig_header = request.headers.get("Stripe-Signature", "")
+
+    try:
+        event = stripe.Webhook.construct_event(raw_body, sig_header, STRIPE_WEBHOOK_SECRET)
+    except stripe.errors.SignatureVerificationError:
+        logger.warning("Invalid Stripe webhook signature")
+        return aiohttp.web.Response(status=400, text="Invalid signature")
+    except Exception:
+        logger.error("Webhook parse error:\n%s", traceback.format_exc())
+        return aiohttp.web.Response(status=400, text="Bad request")
+
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        ref = session.get("client_reference_id")
+        if ref:
+            try:
+                await _handle_successful_payment(int(ref), request.app["bot"])
+            except Exception:
+                logger.error("Payment handler error for ref %s:\n%s", ref, traceback.format_exc())
+
+    return aiohttp.web.Response(status=200, text="OK")
+
+
+async def _handle_successful_payment(telegram_id: int, bot: Bot) -> None:
+    pair = get_user_pair(telegram_id)
+    if not pair:
+        logger.warning("No pair found for telegram_id %s after payment", telegram_id)
+        return
+
+    if pair["subscription_tier"] == "plus":
+        logger.info("User %s already on Plus — ignoring duplicate payment event", telegram_id)
+        return
+
+    upgrade_pair_to_plus(pair["id"])
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT first_name FROM users WHERE user_id = %s", (telegram_id,))
+            row = cur.fetchone()
+            user_name = row["first_name"] if row else "Someone"
+    finally:
+        release_db(conn)
+
+    try:
+        await bot.send_message(
+            telegram_id,
+            "Payment received. Plus is yours. Don't waste it. 🔑",
+        )
+    except Exception as e:
+        logger.error("Failed to notify user %s: %s", telegram_id, e)
+
+    for partner in get_pair_members(pair["id"], exclude_user=telegram_id):
+        try:
+            await bot.send_message(
+                partner["user_id"],
+                f"{user_name} just unlocked Plus. You both have it now. 🔑",
+            )
+        except Exception as e:
+            logger.error("Failed to notify partner %s: %s", partner["user_id"], e)
 
 
 # ---------------------------------------------------------------------------
@@ -897,48 +946,14 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("You're already on Plus. Margot approves.")
         return
 
-    set_pending_upgrade(pair["id"])
-
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Unlock Plus →", url=STRIPE_PAYMENT_LINK),
+        InlineKeyboardButton("Unlock Plus →", url=payment_link_for_user(user.id)),
     ]])
     await update.message.reply_text(
         "Plus unlocks photos, audio, and video — everything Margot needs to do her best work.\n\n"
         "€3.99 a month. Cancel any time.",
         reply_markup=keyboard,
     )
-
-
-async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    upsert_user(user.id, user.username, user.first_name)
-    pair = get_user_pair(user.id)
-
-    if not pair:
-        await update.message.reply_text("Use /start first.")
-        return
-
-    if pair["subscription_tier"] == "plus":
-        await update.message.reply_text("You're already on Plus. Margot approves.")
-        return
-
-    hours = get_pending_upgrade_age_hours(pair["id"])
-    if hours is None or hours > 24:
-        await update.message.reply_text("Nothing to confirm. Use /subscribe first.")
-        return
-
-    upgrade_pair_to_plus(pair["id"])
-    await update.message.reply_text("Done. Plus is yours. Don't waste it. 🔑")
-
-    partners = get_pair_members(pair["id"], exclude_user=user.id)
-    for partner in partners:
-        try:
-            await context.bot.send_message(
-                partner["user_id"],
-                f"{user.first_name} unlocked Plus. You both have it now. 🔑",
-            )
-        except Exception as e:
-            logger.error(f"Failed to notify partner {partner['user_id']}: {e}")
 
 
 async def cmd_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -960,7 +975,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/react — React to a surprise\n"
         "/invite — Invite someone to your space\n"
         "/subscribe — Unlock Plus features\n"
-        "/confirm — Confirm your payment\n"
         "/terms — Subscription terms\n\n"
         "That's everything. I'll be here."
     )
@@ -1107,6 +1121,83 @@ async def daily_check(bot: Bot):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _build_tg_app() -> Application:
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("invite", cmd_invite))
+    app.add_handler(CommandHandler("load", cmd_load))
+    app.add_handler(CommandHandler("open", cmd_open))
+    app.add_handler(CommandHandler("calendar", cmd_calendar))
+    app.add_handler(CommandHandler("outbox", cmd_outbox))
+    app.add_handler(CommandHandler("react", cmd_react))
+    app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+    app.add_handler(CommandHandler("terms", cmd_terms))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal_"))
+    app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm_"))
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO | filters.AUDIO | filters.VOICE |
+         filters.VIDEO | filters.VIDEO_NOTE) & ~filters.COMMAND,
+        handle_incoming_message,
+    ))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+    return app
+
+
+async def _run() -> None:
+    tg_app = _build_tg_app()
+
+    # Webhook server
+    web_app = aiohttp.web.Application()
+    web_app["bot"] = tg_app.bot
+    web_app.router.add_post("/webhook", handle_stripe_webhook)
+    runner = aiohttp.web.AppRunner(web_app)
+    await runner.setup()
+    await aiohttp.web.TCPSite(runner, "0.0.0.0", PORT).start()
+    logger.info("Webhook server listening on port %d", PORT)
+
+    # Scheduler
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_job(daily_check, "cron", hour=9, minute=0, args=[tg_app.bot])
+    scheduler.start()
+
+    # Register BotFather commands
+    await tg_app.bot.set_my_commands([
+        BotCommand("start", "Meet Margot"),
+        BotCommand("load", "Leave a surprise"),
+        BotCommand("open", "Open today's surprise"),
+        BotCommand("calendar", "See what's waiting for you"),
+        BotCommand("outbox", "See what you've prepared"),
+        BotCommand("invite", "Invite someone to your space"),
+        BotCommand("react", "React to a surprise"),
+        BotCommand("subscribe", "Unlock Plus features"),
+        BotCommand("terms", "Subscription terms"),
+        BotCommand("help", "How to use Kept"),
+    ])
+
+    # Signal handling (Linux/Railway)
+    stop = asyncio.Event()
+    if platform.system() != "Windows":
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop.set)
+
+    async with tg_app:
+        await tg_app.start()
+        await tg_app.updater.start_polling(drop_pending_updates=True)
+        logger.info("Margot is ready.")
+        try:
+            await stop.wait()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            await tg_app.updater.stop()
+            await tg_app.stop()
+
+    scheduler.shutdown(wait=False)
+    await runner.cleanup()
+
+
 def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN is not set")
@@ -1134,54 +1225,7 @@ def main():
             logger.info("Retrying in 2 seconds...")
             time.sleep(2)
 
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("invite", cmd_invite))
-    app.add_handler(CommandHandler("load", cmd_load))
-    app.add_handler(CommandHandler("open", cmd_open))
-    app.add_handler(CommandHandler("calendar", cmd_calendar))
-    app.add_handler(CommandHandler("outbox", cmd_outbox))
-    app.add_handler(CommandHandler("react", cmd_react))
-    app.add_handler(CommandHandler("subscribe", cmd_subscribe))
-    app.add_handler(CommandHandler("confirm", cmd_confirm))
-    app.add_handler(CommandHandler("terms", cmd_terms))
-    app.add_handler(CommandHandler("help", cmd_help))
-
-    async def set_commands(_app):
-        await _app.bot.set_my_commands([
-            BotCommand("start", "Meet Margot"),
-            BotCommand("load", "Leave a surprise"),
-            BotCommand("open", "Open today's surprise"),
-            BotCommand("calendar", "See what's waiting for you"),
-            BotCommand("outbox", "See what you've prepared"),
-            BotCommand("invite", "Invite someone to your space"),
-            BotCommand("react", "React to a surprise"),
-            BotCommand("subscribe", "Unlock Plus features"),
-            BotCommand("confirm", "Confirm your payment"),
-            BotCommand("terms", "Subscription terms"),
-            BotCommand("help", "How to use Kept"),
-        ])
-
-    app.post_init = set_commands
-
-    app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal_"))
-    app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm_"))
-
-    app.add_handler(MessageHandler(
-        (filters.TEXT | filters.PHOTO | filters.AUDIO | filters.VOICE |
-         filters.VIDEO | filters.VIDEO_NOTE) & ~filters.COMMAND,
-        handle_incoming_message,
-    ))
-
-    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
-
-    scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(daily_check, "cron", hour=9, minute=0, args=[app.bot])
-    scheduler.start()
-
-    logger.info("Margot is ready.")
-    app.run_polling(drop_pending_updates=True)
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":
