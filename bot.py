@@ -8,7 +8,7 @@ import time
 import traceback
 import uuid
 from calendar import monthcalendar, month_name
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from urllib.parse import urlencode, urlparse, urlunparse
 
 import aiohttp.web
@@ -39,7 +39,8 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK", "https://buy.stripe.com/placeholder")
+STRIPE_MONTHLY_LINK = os.getenv("STRIPE_MONTHLY_LINK", "https://buy.stripe.com/placeholder")
+STRIPE_ANNUAL_LINK = os.getenv("STRIPE_ANNUAL_LINK", "https://buy.stripe.com/placeholder")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -131,6 +132,14 @@ def init_db():
             cur.execute("""
                 ALTER TABLE pairs
                 ADD COLUMN IF NOT EXISTS pending_upgrade_at TIMESTAMP;
+            """)
+            cur.execute("""
+                ALTER TABLE pairs
+                ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMP;
+            """)
+            cur.execute("""
+                ALTER TABLE pairs
+                ADD COLUMN IF NOT EXISTS trial_notified BOOLEAN DEFAULT FALSE;
             """)
             cur.execute("""
                 ALTER TABLE surprises
@@ -236,7 +245,7 @@ def create_invite(pair_id: int, user_id: int) -> str:
     return token
 
 
-def use_invite(token: str, user_id: int) -> int | None:
+def use_invite(token: str, user_id: int) -> tuple[int, bool] | None:
     conn = get_db()
     try:
         with conn.cursor() as cur:
@@ -251,6 +260,12 @@ def use_invite(token: str, user_id: int) -> int | None:
             if existing:
                 return None
             cur.execute(
+                "SELECT COUNT(*) AS cnt FROM pair_members WHERE pair_id = %s AND user_id > 0",
+                (invite["pair_id"],),
+            )
+            member_count = cur.fetchone()["cnt"]
+            trial_started = member_count == 1
+            cur.execute(
                 "UPDATE invites SET used_by = %s, used_at = NOW() WHERE token = %s",
                 (user_id, token),
             )
@@ -258,8 +273,13 @@ def use_invite(token: str, user_id: int) -> int | None:
                 "INSERT INTO pair_members (pair_id, user_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
                 (invite["pair_id"], user_id),
             )
+            if trial_started:
+                cur.execute(
+                    "UPDATE pairs SET trial_started_at = NOW() WHERE id = %s",
+                    (invite["pair_id"],),
+                )
         conn.commit()
-        return invite["pair_id"]
+        return invite["pair_id"], trial_started
     finally:
         release_db(conn)
 
@@ -484,10 +504,27 @@ def upgrade_pair_to_plus(pair_id: int):
         release_db(conn)
 
 
-def payment_link_for_user(user_id: int) -> str:
-    parsed = urlparse(STRIPE_PAYMENT_LINK)
+def payment_link_for_user(user_id: int, link: str) -> str:
+    parsed = urlparse(link)
     query = urlencode({"client_reference_id": user_id})
     return urlunparse(parsed._replace(query=query))
+
+
+def is_plus_or_trial(pair) -> bool:
+    if pair["subscription_tier"] == "plus":
+        return True
+    trial_start = pair.get("trial_started_at")
+    if trial_start:
+        return datetime.now() < trial_start + timedelta(days=7)
+    return False
+
+
+def trial_days_remaining(pair) -> int:
+    trial_start = pair.get("trial_started_at")
+    if not trial_start:
+        return 0
+    delta = trial_start + timedelta(days=7) - datetime.now()
+    return max(0, delta.days)
 
 
 # ---------------------------------------------------------------------------
@@ -664,8 +701,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if args and args[0].startswith("invite_"):
         token = args[0][7:]
-        pair_id = use_invite(token, user.id)
-        if pair_id:
+        result = use_invite(token, user.id)
+        if result:
+            pair_id, trial_started = result
             members = get_pair_members(pair_id, exclude_user=user.id)
             inviter_name = members[0]["first_name"] if members else "someone"
             await update.message.reply_text(
@@ -673,6 +711,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "I hold things here until the right moment. "
                 "Use /load to leave something."
             )
+            if trial_started:
+                trial_msg = (
+                    "You have 7 days of Plus to explore everything. "
+                    "After that, the surprises stay — only new media uploads require a subscription. 🔑"
+                )
+                await update.message.reply_text(trial_msg)
+                for m in members:
+                    try:
+                        await context.bot.send_message(m["user_id"], trial_msg)
+                    except Exception as e:
+                        logger.error("Failed to notify %s of trial start: %s", m["user_id"], e)
         else:
             await update.message.reply_text(
                 "That link has already been used or isn't valid."
@@ -691,7 +740,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Oh, you found me. Good.\n\n"
         "I'm Margot. I keep things safe until the moment is right.\n\n"
         "Use /invite to bring someone into your space, "
-        "then /load to leave them something."
+        "then /load to leave them something.\n\n"
+        "When your partner joins, you'll both get 7 days of Plus free. 🔑"
     )
 
 
@@ -856,7 +906,7 @@ async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mark_surprise_opened(surprise["id"])
     await deliver_surprise(update.message.chat_id, surprise, context.bot)
 
-    if pair["subscription_tier"] == "plus":
+    if is_plus_or_trial(pair):
         context.user_data["awaiting_reaction_for"] = surprise["id"]
         await update.message.reply_text(
             "Send me your reaction — emoji, words, a voice note. Or skip with /calendar."
@@ -868,7 +918,7 @@ async def cmd_react(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(user.id, user.username, user.first_name)
     pair = get_user_pair(user.id)
 
-    if not pair or pair["subscription_tier"] != "plus":
+    if not pair or not is_plus_or_trial(pair):
         await update.message.reply_text(
             "That's a Plus feature. Upgrade with /subscribe to unlock reactions."
         )
@@ -991,13 +1041,29 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Unlock Plus →", url=payment_link_for_user(user.id)),
+        InlineKeyboardButton("Monthly — €3.99", url=payment_link_for_user(user.id, STRIPE_MONTHLY_LINK)),
+        InlineKeyboardButton("Annual — €29.99", url=payment_link_for_user(user.id, STRIPE_ANNUAL_LINK)),
     ]])
-    await update.message.reply_text(
-        "Plus unlocks photos, audio, and video — everything Margot needs to do her best work.\n\n"
-        "€3.99 a month. Cancel any time.",
-        reply_markup=keyboard,
-    )
+
+    if pair.get("trial_started_at") and is_plus_or_trial(pair):
+        days = trial_days_remaining(pair)
+        await update.message.reply_text(
+            f"You're on a 7-day Plus trial. {days} {'day' if days == 1 else 'days'} left.\n\n"
+            "Keep exploring — or lock in Plus now.",
+            reply_markup=keyboard,
+        )
+    elif pair.get("trial_started_at"):
+        await update.message.reply_text(
+            "Your trial has ended. Everything you loaded is still here.\n\n"
+            "Subscribe to unlock media again.",
+            reply_markup=keyboard,
+        )
+    else:
+        await update.message.reply_text(
+            "Plus unlocks photos, audio, and video — everything Margot needs to do her best work.\n\n"
+            "Try it free for 7 days when your partner joins.",
+            reply_markup=keyboard,
+        )
 
 
 _FAKE_MEMBERS = [
@@ -1113,6 +1179,57 @@ async def cmd_testunsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # DEV ONLY - remove before launch
+async def cmd_testtrial(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    try:
+        pair = get_user_pair(user.id)
+        if not pair:
+            await update.message.reply_text("No pair found.")
+            return
+
+        sub = context.args[0].lower() if context.args else "status"
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                if sub == "start":
+                    cur.execute(
+                        "UPDATE pairs SET trial_started_at = NOW(), trial_notified = FALSE WHERE id = %s",
+                        (pair["id"],),
+                    )
+                    conn.commit()
+                    await update.message.reply_text("Trial started. trial_started_at = NOW().")
+                elif sub == "expire":
+                    cur.execute(
+                        "UPDATE pairs SET trial_started_at = NOW() - INTERVAL '8 days', trial_notified = FALSE WHERE id = %s",
+                        (pair["id"],),
+                    )
+                    conn.commit()
+                    await update.message.reply_text("Trial force-expired. trial_started_at = 8 days ago.")
+                elif sub == "status":
+                    cur.execute(
+                        "SELECT subscription_tier, trial_started_at, trial_notified FROM pairs WHERE id = %s",
+                        (pair["id"],),
+                    )
+                    row = cur.fetchone()
+                    active = is_plus_or_trial(row)
+                    days = trial_days_remaining(row) if active and row["trial_started_at"] else 0
+                    await update.message.reply_text(
+                        f"tier: {row['subscription_tier']}\n"
+                        f"trial_started_at: {row['trial_started_at']}\n"
+                        f"trial_notified: {row['trial_notified']}\n"
+                        f"is_plus_or_trial: {active}\n"
+                        f"days_remaining: {days}"
+                    )
+                else:
+                    await update.message.reply_text("Usage: /testtrial start|expire|status")
+        finally:
+            release_db(conn)
+    except Exception as e:
+        logger.error("testtrial error:\n%s", traceback.format_exc())
+        await update.message.reply_text(f"Dev error: {e}")
+
+
+# DEV ONLY - remove before launch
 async def cmd_testopensender(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     try:
@@ -1200,6 +1317,9 @@ async def cmd_devhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/testinvite <1-3> — add fake members to your space\n"
         "/testclearinvites — remove all fake members\n"
         "/testunsubscribe — reset pair back to free tier\n"
+        "/testtrial start — start 7-day trial now\n"
+        "/testtrial expire — force trial to 8 days ago\n"
+        "/testtrial status — show trial state\n"
         "/testopensender — deliver your next loaded surprise now\n"
         "/testopenreceiver — receive your next incoming surprise now\n"
         "/devhelp — show this list"
@@ -1272,7 +1392,7 @@ async def _handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pending_date = date.fromisoformat(pending_date_str)
     msg = update.message
-    is_plus = pair["subscription_tier"] == "plus"
+    is_plus = is_plus_or_trial(pair)
 
     media_type, file_id = _extract_media(msg)
     caption = msg.caption if msg.caption else None
@@ -1344,6 +1464,52 @@ async def _handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Scheduler
 # ---------------------------------------------------------------------------
 
+async def _check_expired_trials(bot: Bot):
+    expired_pair_ids = []
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM pairs
+                WHERE subscription_tier != 'plus'
+                  AND trial_started_at IS NOT NULL
+                  AND trial_started_at < NOW() - INTERVAL '7 days'
+                  AND trial_notified = FALSE
+                """
+            )
+            expired_pair_ids = [row["id"] for row in cur.fetchall()]
+            if expired_pair_ids:
+                cur.execute(
+                    "UPDATE pairs SET trial_notified = TRUE WHERE id = ANY(%s)",
+                    (expired_pair_ids,),
+                )
+        conn.commit()
+    finally:
+        release_db(conn)
+
+    for pair_id in expired_pair_ids:
+        members = get_pair_members(pair_id)
+        for m in members:
+            if m["user_id"] < 0:
+                continue
+            try:
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "Keep Plus →",
+                        url=payment_link_for_user(m["user_id"], STRIPE_MONTHLY_LINK),
+                    ),
+                ]])
+                await bot.send_message(
+                    m["user_id"],
+                    "Your Plus trial has ended. Everything you loaded is still here — "
+                    "only new media uploads require a subscription.",
+                    reply_markup=keyboard,
+                )
+            except Exception as e:
+                logger.error("Failed to notify %s of trial expiry: %s", m["user_id"], e)
+
+
 async def daily_check(bot: Bot):
     today = date.today()
     conn = get_db()
@@ -1376,6 +1542,8 @@ async def daily_check(bot: Bot):
         except Exception as e:
             logger.error(f"Failed to notify {r['user_id']}: {e}")
 
+    await _check_expired_trials(bot)
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -1394,6 +1562,7 @@ def _build_tg_app() -> Application:
     app.add_handler(CommandHandler("terms", cmd_terms))
     _dev = filters.User(username="geopardi")
     app.add_handler(CommandHandler("testunsubscribe", cmd_testunsubscribe, filters=_dev))  # DEV ONLY
+    app.add_handler(CommandHandler("testtrial", cmd_testtrial, filters=_dev))  # DEV ONLY
     app.add_handler(CommandHandler("testinvite", cmd_testinvite, filters=_dev))  # DEV ONLY
     app.add_handler(CommandHandler("testclearinvites", cmd_testclearinvites, filters=_dev))  # DEV ONLY
     app.add_handler(CommandHandler("testopensender", cmd_testopensender, filters=_dev))  # DEV ONLY
