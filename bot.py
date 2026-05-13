@@ -54,9 +54,10 @@ def init_db():
                 );
 
                 CREATE TABLE IF NOT EXISTS pairs (
-                    id                SERIAL PRIMARY KEY,
-                    created_at        TIMESTAMP DEFAULT NOW(),
-                    subscription_tier TEXT DEFAULT 'free'
+                    id                   SERIAL PRIMARY KEY,
+                    created_at           TIMESTAMP DEFAULT NOW(),
+                    subscription_tier    TEXT DEFAULT 'free',
+                    pending_upgrade_at   TIMESTAMP
                 );
 
                 CREATE TABLE IF NOT EXISTS pair_members (
@@ -100,6 +101,10 @@ def init_db():
                     created_at   TIMESTAMP DEFAULT NOW()
                 );
             """)
+        cur.execute("""
+            ALTER TABLE pairs
+            ADD COLUMN IF NOT EXISTS pending_upgrade_at TIMESTAMP;
+        """)
         conn.commit()
     finally:
         conn.close()
@@ -423,6 +428,51 @@ def get_last_opened_surprise_for_user(user_id: int):
             )
             row = cur.fetchone()
             return row["id"] if row else None
+    finally:
+        conn.close()
+
+
+def set_pending_upgrade(pair_id: int):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE pairs SET pending_upgrade_at = NOW() WHERE id = %s",
+                (pair_id,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_pending_upgrade_age_hours(pair_id: int) -> float | None:
+    """Returns hours since pending_upgrade_at was set, or None if not set."""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT EXTRACT(EPOCH FROM (NOW() - pending_upgrade_at)) / 3600 AS hours
+                FROM pairs
+                WHERE id = %s AND pending_upgrade_at IS NOT NULL
+                """,
+                (pair_id,),
+            )
+            row = cur.fetchone()
+            return row["hours"] if row else None
+    finally:
+        conn.close()
+
+
+def upgrade_pair_to_plus(pair_id: int):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE pairs SET subscription_tier = 'plus', pending_upgrade_at = NULL WHERE id = %s",
+                (pair_id,),
+            )
+        conn.commit()
     finally:
         conn.close()
 
@@ -816,8 +866,68 @@ async def cmd_outbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    upsert_user(user.id, user.username, user.first_name)
+    pair = get_user_pair(user.id)
+
+    if not pair:
+        await update.message.reply_text("Use /start first.")
+        return
+
+    if pair["subscription_tier"] == "plus":
+        await update.message.reply_text("You're already on Plus. Margot approves.")
+        return
+
+    set_pending_upgrade(pair["id"])
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Unlock Plus →", url=STRIPE_PAYMENT_LINK),
+    ]])
     await update.message.reply_text(
-        f"Unlock photos, audio, video and reactions.\n\n{STRIPE_PAYMENT_LINK}"
+        "Plus unlocks photos, audio, and video — everything Margot needs to do her best work.\n\n"
+        "€3.99 a month. Cancel any time.",
+        reply_markup=keyboard,
+    )
+
+
+async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    upsert_user(user.id, user.username, user.first_name)
+    pair = get_user_pair(user.id)
+
+    if not pair:
+        await update.message.reply_text("Use /start first.")
+        return
+
+    if pair["subscription_tier"] == "plus":
+        await update.message.reply_text("You're already on Plus. Margot approves.")
+        return
+
+    hours = get_pending_upgrade_age_hours(pair["id"])
+    if hours is None or hours > 24:
+        await update.message.reply_text("Nothing to confirm. Use /subscribe first.")
+        return
+
+    upgrade_pair_to_plus(pair["id"])
+    await update.message.reply_text("Done. Plus is yours. Don't waste it. 🔑")
+
+    partners = get_pair_members(pair["id"], exclude_user=user.id)
+    for partner in partners:
+        try:
+            await context.bot.send_message(
+                partner["user_id"],
+                f"{user.first_name} unlocked Plus. You both have it now. 🔑",
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify partner {partner['user_id']}: {e}")
+
+
+async def cmd_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Kept Plus is a monthly subscription at €3.99.\n"
+        "You can cancel any time by contacting us.\n"
+        "Surprises already loaded are yours regardless of subscription status.\n\n"
+        "Questions: [add your contact later]"
     )
 
 
@@ -830,7 +940,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/outbox — See what you've prepared\n"
         "/react — React to a surprise\n"
         "/invite — Invite someone to your space\n"
-        "/subscribe — Unlock Plus features\n\n"
+        "/subscribe — Unlock Plus features\n"
+        "/confirm — Confirm your payment\n"
+        "/terms — Subscription terms\n\n"
         "That's everything. I'll be here."
     )
 
@@ -1002,6 +1114,8 @@ def main():
     app.add_handler(CommandHandler("outbox", cmd_outbox))
     app.add_handler(CommandHandler("react", cmd_react))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+    app.add_handler(CommandHandler("confirm", cmd_confirm))
+    app.add_handler(CommandHandler("terms", cmd_terms))
     app.add_handler(CommandHandler("help", cmd_help))
 
     async def set_commands(_app):
@@ -1014,6 +1128,8 @@ def main():
             BotCommand("invite", "Invite someone to your space"),
             BotCommand("react", "React to a surprise"),
             BotCommand("subscribe", "Unlock Plus features"),
+            BotCommand("confirm", "Confirm your payment"),
+            BotCommand("terms", "Subscription terms"),
             BotCommand("help", "How to use Kept"),
         ])
 
