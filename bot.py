@@ -576,8 +576,7 @@ async def cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = await context.bot.get_me()
     link = f"https://t.me/{me.username}?start=invite_{token}"
 
-    await update.message.reply_text(f"Send this to them. It works once.\n\n{link}")
-    await update.message.reply_text(f"Or copy the link directly:\n{link}", disable_web_page_preview=True)
+    await update.message.reply_text(f"🔑 One key. Send it to them.\n\n{link}")
 
 
 async def cmd_load(update: Update, context: ContextTypes.DEFAULT_TYPE):
