@@ -1,12 +1,15 @@
 import os
 import logging
 import platform
+import time
+import traceback
 import uuid
 from calendar import monthcalendar, month_name
 from datetime import date
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -32,32 +35,48 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK", "https://buy.stripe.com/placeholder")
 
+_pool: psycopg2.pool.SimpleConnectionPool | None = None
+
 
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
 
+def _init_pool() -> None:
+    global _pool
+    _pool = psycopg2.pool.SimpleConnectionPool(
+        minconn=1,
+        maxconn=10,
+        dsn=DATABASE_URL,
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    )
+
+
 def get_db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    return _pool.getconn()
+
+
+def release_db(conn) -> None:
+    _pool.putconn(conn)
 
 
 def init_db():
-    conn = get_db()
+    _conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        with conn.cursor() as cur:
+        with _conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
-                    user_id   BIGINT PRIMARY KEY,
-                    username  TEXT,
+                    user_id    BIGINT PRIMARY KEY,
+                    username   TEXT,
                     first_name TEXT,
                     created_at TIMESTAMP DEFAULT NOW()
                 );
 
                 CREATE TABLE IF NOT EXISTS pairs (
-                    id                   SERIAL PRIMARY KEY,
-                    created_at           TIMESTAMP DEFAULT NOW(),
-                    subscription_tier    TEXT DEFAULT 'free',
-                    pending_upgrade_at   TIMESTAMP
+                    id                 SERIAL PRIMARY KEY,
+                    created_at         TIMESTAMP DEFAULT NOW(),
+                    subscription_tier  TEXT DEFAULT 'free',
+                    pending_upgrade_at TIMESTAMP
                 );
 
                 CREATE TABLE IF NOT EXISTS pair_members (
@@ -101,13 +120,13 @@ def init_db():
                     created_at   TIMESTAMP DEFAULT NOW()
                 );
             """)
-        cur.execute("""
-            ALTER TABLE pairs
-            ADD COLUMN IF NOT EXISTS pending_upgrade_at TIMESTAMP;
-        """)
-        conn.commit()
+            cur.execute("""
+                ALTER TABLE pairs
+                ADD COLUMN IF NOT EXISTS pending_upgrade_at TIMESTAMP;
+            """)
+        _conn.commit()
     finally:
-        conn.close()
+        _conn.close()
 
 
 def upsert_user(user_id: int, username: str | None, first_name: str | None):
@@ -125,7 +144,7 @@ def upsert_user(user_id: int, username: str | None, first_name: str | None):
             )
         conn.commit()
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def get_user_pair(user_id: int):
@@ -144,7 +163,7 @@ def get_user_pair(user_id: int):
             )
             return cur.fetchone()
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def get_pair_members(pair_id: int, exclude_user: int | None = None):
@@ -171,7 +190,7 @@ def get_pair_members(pair_id: int, exclude_user: int | None = None):
                 )
             return cur.fetchall()
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def create_pair(user_id: int) -> int:
@@ -187,7 +206,7 @@ def create_pair(user_id: int) -> int:
         conn.commit()
         return pair_id
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def create_invite(pair_id: int, user_id: int) -> str:
@@ -201,7 +220,7 @@ def create_invite(pair_id: int, user_id: int) -> str:
             )
         conn.commit()
     finally:
-        conn.close()
+        release_db(conn)
     return token
 
 
@@ -230,7 +249,7 @@ def use_invite(token: str, user_id: int) -> int | None:
         conn.commit()
         return invite["pair_id"]
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def get_surprise_for_date(pair_id: int, creator_id: int, scheduled_date: date):
@@ -246,7 +265,7 @@ def get_surprise_for_date(pair_id: int, creator_id: int, scheduled_date: date):
             )
             return cur.fetchone()
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def get_todays_surprises_for_user(user_id: int, today: date):
@@ -268,7 +287,7 @@ def get_todays_surprises_for_user(user_id: int, today: date):
             )
             return cur.fetchall()
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def get_next_surprise_for_user(user_id: int, today: date):
@@ -292,7 +311,7 @@ def get_next_surprise_for_user(user_id: int, today: date):
             )
             return cur.fetchone()
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def save_surprise(
@@ -327,7 +346,7 @@ def save_surprise(
         conn.commit()
         return row["id"]
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def mark_surprise_opened(surprise_id: int):
@@ -340,7 +359,7 @@ def mark_surprise_opened(surprise_id: int):
             )
         conn.commit()
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def get_surprise_creator(surprise_id: int) -> int | None:
@@ -351,7 +370,7 @@ def get_surprise_creator(surprise_id: int) -> int | None:
             row = cur.fetchone()
             return row["creator_id"] if row else None
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def save_reaction(
@@ -373,7 +392,7 @@ def save_reaction(
             )
         conn.commit()
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def get_creator_surprises(pair_id: int, creator_id: int):
@@ -390,7 +409,7 @@ def get_creator_surprises(pair_id: int, creator_id: int):
             )
             return cur.fetchall()
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def get_inbound_surprises_for_user(pair_id: int, user_id: int):
@@ -407,7 +426,7 @@ def get_inbound_surprises_for_user(pair_id: int, user_id: int):
             )
             return cur.fetchall()
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def get_last_opened_surprise_for_user(user_id: int):
@@ -429,7 +448,7 @@ def get_last_opened_surprise_for_user(user_id: int):
             row = cur.fetchone()
             return row["id"] if row else None
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def set_pending_upgrade(pair_id: int):
@@ -442,7 +461,7 @@ def set_pending_upgrade(pair_id: int):
             )
         conn.commit()
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def get_pending_upgrade_age_hours(pair_id: int) -> float | None:
@@ -461,7 +480,7 @@ def get_pending_upgrade_age_hours(pair_id: int) -> float | None:
             row = cur.fetchone()
             return row["hours"] if row else None
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def upgrade_pair_to_plus(pair_id: int):
@@ -474,7 +493,7 @@ def upgrade_pair_to_plus(pair_id: int):
             )
         conn.commit()
     finally:
-        conn.close()
+        release_db(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -1072,7 +1091,7 @@ async def daily_check(bot: Bot):
             )
             recipients = cur.fetchall()
     finally:
-        conn.close()
+        release_db(conn)
 
     for r in recipients:
         try:
@@ -1097,12 +1116,23 @@ def main():
         logger.error("DATABASE_URL is not set")
         raise SystemExit(1)
 
-    try:
-        init_db()
-        logger.info("Database ready")
-    except Exception as e:
-        logger.error(f"Database initialisation failed: {e}")
-        raise SystemExit(1)
+    for attempt in range(1, 6):
+        try:
+            init_db()
+            _init_pool()
+            logger.info("Database ready")
+            break
+        except Exception:
+            logger.error(
+                "Database attempt %d/5 failed:\n%s",
+                attempt,
+                traceback.format_exc(),
+            )
+            if attempt == 5:
+                logger.error("Could not connect after 5 attempts. Exiting.")
+                raise SystemExit(1)
+            logger.info("Retrying in 2 seconds...")
+            time.sleep(2)
 
     app = Application.builder().token(BOT_TOKEN).build()
 
