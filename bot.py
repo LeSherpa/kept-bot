@@ -1041,9 +1041,11 @@ async def cmd_testinvite(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
     finally:
         release_db(conn)
-    total = len(get_pair_members(pair["id"]))
+    added = _FAKE_MEMBERS[:count]
+    names = " and ".join(n for _, n in added) if len(added) <= 2 else ", ".join(n for _, n in added[:-1]) + f" and {added[-1][1]}"
+    label = "fake member" if count == 1 else "fake members"
     await update.message.reply_text(
-        f"Done. Your space now has {total} fake members. Test away. 🔑"
+        f"Done. Added {count} {label} — {names}. Test away. 🔑"
     )
 
 
