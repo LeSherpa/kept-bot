@@ -2,12 +2,13 @@ import asyncio
 import os
 import logging
 import platform
+import random
 import signal
 import time
 import traceback
 import uuid
 from calendar import monthcalendar, month_name
-from datetime import date
+from datetime import date, timedelta
 from urllib.parse import urlencode, urlparse, urlunparse
 
 import aiohttp.web
@@ -1000,15 +1001,16 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 _FAKE_MEMBERS = [
-    (-1, "Alice"),
-    (-2, "Bob"),
-    (-3, "Clara"),
+    (-1, "Alice", "Alice left something here for you. Wonder what it is. 🔒"),
+    (-2, "Bob", "Bob has been thinking about you. 🔒"),
+    (-3, "Clara", "Clara wanted you to have this. 🔒"),
 ]
 
 
 # DEV ONLY - remove before launch
 async def cmd_testinvite(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pair = get_user_pair(update.effective_user.id)
+    user = update.effective_user
+    pair = get_user_pair(user.id)
     if not pair:
         await update.message.reply_text("No pair found.")
         return
@@ -1017,10 +1019,16 @@ async def cmd_testinvite(update: Update, context: ContextTypes.DEFAULT_TYPE):
         count = max(1, min(count, 3))
     except (ValueError, IndexError):
         count = 1
+
+    today = date.today()
+    # Pick `count` unique random offsets in [2, 60]
+    offsets = random.sample(range(2, 61), count)
+    surprise_dates = [today + timedelta(days=d) for d in offsets]
+
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            for fake_id, fake_name in _FAKE_MEMBERS[:count]:
+            for (fake_id, fake_name, fake_text), surprise_date in zip(_FAKE_MEMBERS[:count], surprise_dates):
                 cur.execute(
                     """
                     INSERT INTO users (user_id, username, first_name)
@@ -1037,14 +1045,28 @@ async def cmd_testinvite(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     """,
                     (pair["id"], fake_id),
                 )
+                cur.execute(
+                    """
+                    INSERT INTO surprises
+                        (pair_id, creator_id, scheduled_date, media_type, text_content, recipient_id)
+                    VALUES (%s, %s, %s, 'text', %s, %s)
+                    ON CONFLICT (pair_id, creator_id, scheduled_date) DO NOTHING
+                    """,
+                    (pair["id"], fake_id, surprise_date, fake_text, user.id),
+                )
         conn.commit()
     finally:
         release_db(conn)
+
     added = _FAKE_MEMBERS[:count]
-    names = " and ".join(n for _, n in added) if len(added) <= 2 else ", ".join(n for _, n in added[:-1]) + f" and {added[-1][1]}"
+    names = (
+        " and ".join(n for _, n, _ in added)
+        if len(added) <= 2
+        else ", ".join(n for _, n, _ in added[:-1]) + f" and {added[-1][1]}"
+    )
     label = "fake member" if count == 1 else "fake members"
     await update.message.reply_text(
-        f"Done. Added {count} {label} — {names}. Test away. 🔑"
+        f"Done. Added {count} {label} — {names}.\nEach left something for you. Check your calendar. 🔑"
     )
 
 
@@ -1058,13 +1080,17 @@ async def cmd_testclearinvites(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         with conn.cursor() as cur:
             cur.execute(
+                "DELETE FROM surprises WHERE pair_id = %s AND creator_id < 0",
+                (pair["id"],),
+            )
+            cur.execute(
                 "DELETE FROM pair_members WHERE pair_id = %s AND user_id < 0",
                 (pair["id"],),
             )
         conn.commit()
     finally:
         release_db(conn)
-    await update.message.reply_text("Cleared. Back to just you.")
+    await update.message.reply_text("Cleared. Fake members and their surprises removed.")
 
 
 # DEV ONLY - remove before launch
