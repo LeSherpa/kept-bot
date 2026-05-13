@@ -1088,75 +1088,82 @@ async def cmd_testunsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE
 # DEV ONLY - remove before launch
 async def cmd_testopensender(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    pair = get_user_pair(user.id)
-    if not pair:
-        await update.message.reply_text("No pair found.")
-        return
-    conn = get_db()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT s.*, u.first_name AS creator_name
-                FROM surprises s
-                JOIN users u ON u.user_id = s.creator_id
-                WHERE s.pair_id = %s
-                  AND s.creator_id = %s
-                  AND s.is_opened = FALSE
-                ORDER BY s.scheduled_date ASC
-                LIMIT 1
-                """,
-                (pair["id"], user.id),
+        pair = get_user_pair(user.id)
+        if not pair:
+            await update.message.reply_text("No pair found.")
+            return
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT s.*, u.first_name AS creator_name
+                    FROM surprises s
+                    JOIN users u ON u.user_id = s.creator_id
+                    WHERE s.pair_id = %s
+                      AND s.creator_id = %s
+                      AND s.is_opened = FALSE
+                    ORDER BY s.scheduled_date ASC
+                    LIMIT 1
+                    """,
+                    (pair["id"], user.id),
+                )
+                surprise = cur.fetchone()
+        finally:
+            release_db(conn)
+        if not surprise:
+            await update.message.reply_text(
+                "Nothing loaded by you yet.\nUse /load to leave something first."
             )
-            surprise = cur.fetchone()
-    finally:
-        release_db(conn)
-    if not surprise:
-        await update.message.reply_text(
-            "Nothing loaded by you yet.\nUse /load to leave something first."
-        )
-        return
-    recipient_id = surprise["recipient_id"]
-    target_chat = recipient_id if recipient_id else user.id
-    mark_surprise_opened(surprise["id"])
-    await deliver_surprise(target_chat, surprise, context.bot)
+            return
+        mark_surprise_opened(surprise["id"])
+        # Always deliver to the sender in dev mode — recipient may be a fake user
+        await deliver_surprise(update.message.chat_id, surprise, context.bot)
+    except Exception as e:
+        logger.error("testopensender error:\n%s", traceback.format_exc())
+        await update.message.reply_text(f"Dev error: {e}")
 
 
 # DEV ONLY - remove before launch
 async def cmd_testopenreceiver(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    pair = get_user_pair(user.id)
-    if not pair:
-        await update.message.reply_text("No pair found.")
-        return
-    conn = get_db()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT s.*, u.first_name AS creator_name
-                FROM surprises s
-                JOIN users u ON u.user_id = s.creator_id
-                JOIN pair_members pm ON pm.pair_id = s.pair_id
-                WHERE pm.user_id = %s
-                  AND s.creator_id != %s
-                  AND s.is_opened = FALSE
-                  AND (s.recipient_id = %s OR s.recipient_id IS NULL)
-                ORDER BY s.scheduled_date ASC
-                LIMIT 1
-                """,
-                (user.id, user.id, user.id),
+        pair = get_user_pair(user.id)
+        if not pair:
+            await update.message.reply_text("No pair found.")
+            return
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT s.*, u.first_name AS creator_name
+                    FROM surprises s
+                    JOIN users u ON u.user_id = s.creator_id
+                    JOIN pair_members pm ON pm.pair_id = s.pair_id
+                    WHERE pm.user_id = %s
+                      AND s.creator_id != %s
+                      AND s.is_opened = FALSE
+                      AND (s.recipient_id = %s OR s.recipient_id IS NULL)
+                    ORDER BY s.scheduled_date ASC
+                    LIMIT 1
+                    """,
+                    (user.id, user.id, user.id),
+                )
+                surprise = cur.fetchone()
+        finally:
+            release_db(conn)
+        if not surprise:
+            await update.message.reply_text(
+                "Nothing loaded for you yet.\nAsk someone to load something first."
             )
-            surprise = cur.fetchone()
-    finally:
-        release_db(conn)
-    if not surprise:
-        await update.message.reply_text(
-            "Nothing loaded for you yet.\nAsk someone to load something first."
-        )
-        return
-    mark_surprise_opened(surprise["id"])
-    await deliver_surprise(update.message.chat_id, surprise, context.bot)
+            return
+        mark_surprise_opened(surprise["id"])
+        await deliver_surprise(update.message.chat_id, surprise, context.bot)
+    except Exception as e:
+        logger.error("testopenreceiver error:\n%s", traceback.format_exc())
+        await update.message.reply_text(f"Dev error: {e}")
 
 
 # DEV ONLY - remove before launch
