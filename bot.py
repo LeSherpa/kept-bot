@@ -956,6 +956,76 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+_FAKE_MEMBERS = [
+    (-1, "Alice"),
+    (-2, "Bob"),
+    (-3, "Clara"),
+]
+
+
+# DEV ONLY - remove before launch
+async def cmd_testinvite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.username != "geopardi":
+        return
+    pair = get_user_pair(update.effective_user.id)
+    if not pair:
+        await update.message.reply_text("No pair found.")
+        return
+    try:
+        count = int(context.args[0]) if context.args else 1
+        count = max(1, min(count, 3))
+    except (ValueError, IndexError):
+        count = 1
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            for fake_id, fake_name in _FAKE_MEMBERS[:count]:
+                cur.execute(
+                    """
+                    INSERT INTO users (user_id, username, first_name)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id) DO NOTHING
+                    """,
+                    (fake_id, fake_name.lower(), fake_name),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO pair_members (pair_id, user_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (pair["id"], fake_id),
+                )
+        conn.commit()
+    finally:
+        release_db(conn)
+    total = len(get_pair_members(pair["id"]))
+    await update.message.reply_text(
+        f"Done. Your space now has {total} fake members. Test away. 🔑"
+    )
+
+
+# DEV ONLY - remove before launch
+async def cmd_testclearinvites(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.username != "geopardi":
+        return
+    pair = get_user_pair(update.effective_user.id)
+    if not pair:
+        await update.message.reply_text("No pair found.")
+        return
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM pair_members WHERE pair_id = %s AND user_id < 0",
+                (pair["id"],),
+            )
+        conn.commit()
+    finally:
+        release_db(conn)
+    await update.message.reply_text("Cleared. Back to just you.")
+
+
 # DEV ONLY - remove before launch
 async def cmd_testunsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.username != "geopardi":
@@ -1154,6 +1224,8 @@ def _build_tg_app() -> Application:
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("terms", cmd_terms))
     app.add_handler(CommandHandler("testunsubscribe", cmd_testunsubscribe))  # DEV ONLY
+    app.add_handler(CommandHandler("testinvite", cmd_testinvite))  # DEV ONLY
+    app.add_handler(CommandHandler("testclearinvites", cmd_testclearinvites))  # DEV ONLY
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal_"))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm_"))
