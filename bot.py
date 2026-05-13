@@ -1007,8 +1007,6 @@ _FAKE_MEMBERS = [
 
 # DEV ONLY - remove before launch
 async def cmd_testinvite(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.username != "geopardi":
-        return
     pair = get_user_pair(update.effective_user.id)
     if not pair:
         await update.message.reply_text("No pair found.")
@@ -1051,8 +1049,6 @@ async def cmd_testinvite(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # DEV ONLY - remove before launch
 async def cmd_testclearinvites(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.username != "geopardi":
-        return
     pair = get_user_pair(update.effective_user.id)
     if not pair:
         await update.message.reply_text("No pair found.")
@@ -1072,8 +1068,6 @@ async def cmd_testclearinvites(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # DEV ONLY - remove before launch
 async def cmd_testunsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.username != "geopardi":
-        return
     pair = get_user_pair(update.effective_user.id)
     if not pair:
         await update.message.reply_text("No pair found.")
@@ -1092,9 +1086,44 @@ async def cmd_testunsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # DEV ONLY - remove before launch
-async def cmd_testopen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.username != "geopardi":
+async def cmd_testopensender(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    pair = get_user_pair(user.id)
+    if not pair:
+        await update.message.reply_text("No pair found.")
         return
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT s.*, u.first_name AS creator_name
+                FROM surprises s
+                JOIN users u ON u.user_id = s.creator_id
+                WHERE s.pair_id = %s
+                  AND s.creator_id = %s
+                  AND s.is_opened = FALSE
+                ORDER BY s.scheduled_date ASC
+                LIMIT 1
+                """,
+                (pair["id"], user.id),
+            )
+            surprise = cur.fetchone()
+    finally:
+        release_db(conn)
+    if not surprise:
+        await update.message.reply_text(
+            "Nothing loaded by you yet.\nUse /load to leave something first."
+        )
+        return
+    recipient_id = surprise["recipient_id"]
+    target_chat = recipient_id if recipient_id else user.id
+    mark_surprise_opened(surprise["id"])
+    await deliver_surprise(target_chat, surprise, context.bot)
+
+
+# DEV ONLY - remove before launch
+async def cmd_testopenreceiver(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     pair = get_user_pair(user.id)
     if not pair:
@@ -1123,7 +1152,7 @@ async def cmd_testopen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         release_db(conn)
     if not surprise:
         await update.message.reply_text(
-            "Nothing loaded for you yet.\nLoad something first with /load"
+            "Nothing loaded for you yet.\nAsk someone to load something first."
         )
         return
     mark_surprise_opened(surprise["id"])
@@ -1132,14 +1161,13 @@ async def cmd_testopen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # DEV ONLY - remove before launch
 async def cmd_devhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.username != "geopardi":
-        return
     await update.message.reply_text(
         "Dev commands.\n\n"
         "/testinvite <1-3> — add fake members to your space\n"
         "/testclearinvites — remove all fake members\n"
         "/testunsubscribe — reset pair back to free tier\n"
-        "/testopen — open next upcoming surprise ignoring date\n"
+        "/testopensender — deliver your next loaded surprise now\n"
+        "/testopenreceiver — receive your next incoming surprise now\n"
         "/devhelp — show this list"
     )
 
@@ -1328,11 +1356,13 @@ def _build_tg_app() -> Application:
     app.add_handler(CommandHandler("react", cmd_react))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("terms", cmd_terms))
-    app.add_handler(CommandHandler("testunsubscribe", cmd_testunsubscribe))  # DEV ONLY
-    app.add_handler(CommandHandler("testinvite", cmd_testinvite))  # DEV ONLY
-    app.add_handler(CommandHandler("testclearinvites", cmd_testclearinvites))  # DEV ONLY
-    app.add_handler(CommandHandler("testopen", cmd_testopen))  # DEV ONLY
-    app.add_handler(CommandHandler("devhelp", cmd_devhelp))  # DEV ONLY
+    _dev = filters.User(username="geopardi")
+    app.add_handler(CommandHandler("testunsubscribe", cmd_testunsubscribe, filters=_dev))  # DEV ONLY
+    app.add_handler(CommandHandler("testinvite", cmd_testinvite, filters=_dev))  # DEV ONLY
+    app.add_handler(CommandHandler("testclearinvites", cmd_testclearinvites, filters=_dev))  # DEV ONLY
+    app.add_handler(CommandHandler("testopensender", cmd_testopensender, filters=_dev))  # DEV ONLY
+    app.add_handler(CommandHandler("testopenreceiver", cmd_testopenreceiver, filters=_dev))  # DEV ONLY
+    app.add_handler(CommandHandler("devhelp", cmd_devhelp, filters=_dev))  # DEV ONLY
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal_"))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm_"))
