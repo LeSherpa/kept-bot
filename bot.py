@@ -131,6 +131,10 @@ def init_db():
                 ALTER TABLE pairs
                 ADD COLUMN IF NOT EXISTS pending_upgrade_at TIMESTAMP;
             """)
+            cur.execute("""
+                ALTER TABLE surprises
+                ADD COLUMN IF NOT EXISTS recipient_id BIGINT REFERENCES users(user_id);
+            """)
         _conn.commit()
     finally:
         _conn.close()
@@ -289,8 +293,9 @@ def get_todays_surprises_for_user(user_id: int, today: date):
                   AND s.creator_id != %s
                   AND s.scheduled_date = %s
                   AND s.is_opened = FALSE
+                  AND (s.recipient_id = %s OR s.recipient_id IS NULL)
                 """,
-                (user_id, user_id, today),
+                (user_id, user_id, today, user_id),
             )
             return cur.fetchall()
     finally:
@@ -311,10 +316,11 @@ def get_next_surprise_for_user(user_id: int, today: date):
                   AND s.creator_id != %s
                   AND s.scheduled_date > %s
                   AND s.is_opened = FALSE
+                  AND (s.recipient_id = %s OR s.recipient_id IS NULL)
                 ORDER BY s.scheduled_date ASC
                 LIMIT 1
                 """,
-                (today, user_id, user_id, today),
+                (today, user_id, user_id, today, user_id),
             )
             return cur.fetchone()
     finally:
@@ -329,6 +335,7 @@ def save_surprise(
     file_id: str | None = None,
     caption: str | None = None,
     text_content: str | None = None,
+    recipient_id: int | None = None,
 ) -> int:
     conn = get_db()
     try:
@@ -336,18 +343,19 @@ def save_surprise(
             cur.execute(
                 """
                 INSERT INTO surprises
-                    (pair_id, creator_id, scheduled_date, media_type, file_id, caption, text_content)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (pair_id, creator_id, scheduled_date, media_type, file_id, caption, text_content, recipient_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (pair_id, creator_id, scheduled_date) DO UPDATE SET
                     media_type   = EXCLUDED.media_type,
                     file_id      = EXCLUDED.file_id,
                     caption      = EXCLUDED.caption,
                     text_content = EXCLUDED.text_content,
+                    recipient_id = EXCLUDED.recipient_id,
                     is_opened    = FALSE,
                     opened_at    = NULL
                 RETURNING id
                 """,
-                (pair_id, creator_id, scheduled_date, media_type, file_id, caption, text_content),
+                (pair_id, creator_id, scheduled_date, media_type, file_id, caption, text_content, recipient_id),
             )
             row = cur.fetchone()
         conn.commit()
@@ -408,9 +416,11 @@ def get_creator_surprises(pair_id: int, creator_id: int):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT * FROM surprises
-                WHERE pair_id = %s AND creator_id = %s
-                ORDER BY scheduled_date ASC
+                SELECT s.*, u.first_name AS recipient_name
+                FROM surprises s
+                LEFT JOIN users u ON u.user_id = s.recipient_id
+                WHERE s.pair_id = %s AND s.creator_id = %s
+                ORDER BY s.scheduled_date ASC
                 """,
                 (pair_id, creator_id),
             )
@@ -426,10 +436,12 @@ def get_inbound_surprises_for_user(pair_id: int, user_id: int):
             cur.execute(
                 """
                 SELECT * FROM surprises
-                WHERE pair_id = %s AND creator_id != %s
+                WHERE pair_id = %s
+                  AND creator_id != %s
+                  AND (recipient_id = %s OR recipient_id IS NULL)
                 ORDER BY scheduled_date ASC
                 """,
-                (pair_id, user_id),
+                (pair_id, user_id, user_id),
             )
             return cur.fetchall()
     finally:
@@ -720,6 +732,23 @@ async def cmd_load(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _show_recipient_picker_or_proceed(query, context, pair, user_id) -> None:
+    others = get_pair_members(pair["id"], exclude_user=user_id)
+    if len(others) == 1:
+        context.user_data["pending_recipient_id"] = others[0]["user_id"]
+        context.user_data["awaiting_content"] = True
+        await query.edit_message_text("Good choice. Now send me what you want to leave.")
+    else:
+        buttons = [
+            [InlineKeyboardButton(m["first_name"], callback_data=f"recipient_{m['user_id']}")]
+            for m in others
+        ]
+        await query.edit_message_text(
+            "Who is this for?",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+
 async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -731,6 +760,7 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "cal_cancel":
         context.user_data.pop("awaiting_content", None)
         context.user_data.pop("pending_date", None)
+        context.user_data.pop("pending_recipient_id", None)
         await query.edit_message_text("Cancelled.")
         return
 
@@ -769,10 +799,7 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=keyboard,
             )
         else:
-            context.user_data["awaiting_content"] = True
-            await query.edit_message_text(
-                "Good choice. Now send me what you want to leave."
-            )
+            await _show_recipient_picker_or_proceed(query, context, pair, user.id)
 
 
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -781,12 +808,23 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "confirm_keep":
         context.user_data.pop("pending_date", None)
+        context.user_data.pop("pending_recipient_id", None)
         await query.edit_message_text("Kept as it was.")
         return
 
     if query.data == "confirm_replace":
-        context.user_data["awaiting_content"] = True
-        await query.edit_message_text("Good choice. Now send me what you want to leave.")
+        user = update.effective_user
+        pair = get_user_pair(user.id)
+        await _show_recipient_picker_or_proceed(query, context, pair, user.id)
+
+
+async def recipient_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    recipient_id = int(query.data.split("_", 1)[1])
+    context.user_data["pending_recipient_id"] = recipient_id
+    context.user_data["awaiting_content"] = True
+    await query.edit_message_text("Good choice. Now send me what you want to leave.")
 
 
 async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -915,13 +953,17 @@ async def cmd_outbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = date.today()
     upcoming = [s for s in surprises if s["scheduled_date"] > today and not s["is_opened"]]
     delivered = [s for s in surprises if s["is_opened"] or s["scheduled_date"] <= today]
+    multi_member = len(partners) > 1
 
     lines = [f"Here's what you've left for {partner_name}.", ""]
 
     for s in upcoming:
         label = friendly_date(s["scheduled_date"])
         kind = _MEDIA_LABEL.get(s["media_type"], s["media_type"])
-        lines.append(f"{label} — {kind}")
+        if multi_member and s.get("recipient_name"):
+            lines.append(f"{label} — {kind} → {s['recipient_name']}")
+        else:
+            lines.append(f"{label} — {kind}")
 
     if delivered:
         if upcoming:
@@ -1133,17 +1175,24 @@ async def _handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("I can hold text, photos, audio or video.")
         return
 
-    save_surprise(pair["id"], user.id, pending_date, media_type, file_id, caption, text_content)
+    recipient_id = context.user_data.get("pending_recipient_id")
+    save_surprise(pair["id"], user.id, pending_date, media_type, file_id, caption, text_content, recipient_id)
 
-    recipients = get_pair_members(pair["id"], exclude_user=user.id)
-    recipient_name = recipients[0]["first_name"] if recipients else "them"
+    if recipient_id:
+        members = get_pair_members(pair["id"], exclude_user=user.id)
+        match = next((m for m in members if m["user_id"] == recipient_id), None)
+        recipient_name = match["first_name"] if match else "them"
+    else:
+        others = get_pair_members(pair["id"], exclude_user=user.id)
+        recipient_name = others[0]["first_name"] if others else "them"
 
     context.user_data.pop("awaiting_content", None)
     context.user_data.pop("pending_date", None)
+    context.user_data.pop("pending_recipient_id", None)
 
     await msg.reply_text(
         f"Locked away. {recipient_name} will receive it on "
-        f"{friendly_date(pending_date)}. I won't say a word."
+        f"{friendly_date(pending_date)}. I won't say a word. 🔒"
     )
 
 
@@ -1191,6 +1240,7 @@ async def daily_check(bot: Bot):
                 WHERE s.scheduled_date = %s
                   AND s.creator_id != pm.user_id
                   AND s.is_opened = FALSE
+                  AND (s.recipient_id = pm.user_id OR s.recipient_id IS NULL)
                 """,
                 (today,),
             )
@@ -1229,6 +1279,7 @@ def _build_tg_app() -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal_"))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm_"))
+    app.add_handler(CallbackQueryHandler(recipient_callback, pattern=r"^recipient_"))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.AUDIO | filters.VOICE |
          filters.VIDEO | filters.VIDEO_NOTE) & ~filters.COMMAND,
