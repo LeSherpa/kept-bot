@@ -1091,6 +1091,59 @@ async def cmd_testunsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("Done. Back to free. Go test /subscribe again.")
 
 
+# DEV ONLY - remove before launch
+async def cmd_testopen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.username != "geopardi":
+        return
+    user = update.effective_user
+    pair = get_user_pair(user.id)
+    if not pair:
+        await update.message.reply_text("No pair found.")
+        return
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT s.*, u.first_name AS creator_name
+                FROM surprises s
+                JOIN users u ON u.user_id = s.creator_id
+                JOIN pair_members pm ON pm.pair_id = s.pair_id
+                WHERE pm.user_id = %s
+                  AND s.creator_id != %s
+                  AND s.is_opened = FALSE
+                  AND (s.recipient_id = %s OR s.recipient_id IS NULL)
+                ORDER BY s.scheduled_date ASC
+                LIMIT 1
+                """,
+                (user.id, user.id, user.id),
+            )
+            surprise = cur.fetchone()
+    finally:
+        release_db(conn)
+    if not surprise:
+        await update.message.reply_text(
+            "Nothing loaded for you yet.\nLoad something first with /load"
+        )
+        return
+    mark_surprise_opened(surprise["id"])
+    await deliver_surprise(update.message.chat_id, surprise, context.bot)
+
+
+# DEV ONLY - remove before launch
+async def cmd_devhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.username != "geopardi":
+        return
+    await update.message.reply_text(
+        "Dev commands.\n\n"
+        "/testinvite <1-3> — add fake members to your space\n"
+        "/testclearinvites — remove all fake members\n"
+        "/testunsubscribe — reset pair back to free tier\n"
+        "/testopen — open next upcoming surprise ignoring date\n"
+        "/devhelp — show this list"
+    )
+
+
 async def cmd_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Kept Plus is a monthly subscription at €3.99.\n"
@@ -1278,6 +1331,8 @@ def _build_tg_app() -> Application:
     app.add_handler(CommandHandler("testunsubscribe", cmd_testunsubscribe))  # DEV ONLY
     app.add_handler(CommandHandler("testinvite", cmd_testinvite))  # DEV ONLY
     app.add_handler(CommandHandler("testclearinvites", cmd_testclearinvites))  # DEV ONLY
+    app.add_handler(CommandHandler("testopen", cmd_testopen))  # DEV ONLY
+    app.add_handler(CommandHandler("devhelp", cmd_devhelp))  # DEV ONLY
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal_"))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm_"))
