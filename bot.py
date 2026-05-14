@@ -3,6 +3,7 @@ import os
 import logging
 import platform
 import random
+import re
 import signal
 import time
 import traceback
@@ -10,6 +11,7 @@ import uuid
 from calendar import monthcalendar, month_name
 from datetime import date, datetime, timedelta
 from urllib.parse import urlencode, urlparse, urlunparse
+from zoneinfo import ZoneInfo
 
 import aiohttp.web
 import psycopg2
@@ -44,7 +46,10 @@ STRIPE_ANNUAL_LINK = os.getenv("STRIPE_ANNUAL_LINK", "https://buy.stripe.com/pla
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 PORT = int(os.getenv("PORT", "8080"))
 
+PRAGUE = ZoneInfo("Europe/Prague")
+
 _pool: psycopg2.pool.SimpleConnectionPool | None = None
+_scheduler: AsyncIOScheduler | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -130,20 +135,35 @@ def init_db():
                 );
             """)
             cur.execute("""
-                ALTER TABLE pairs
-                ADD COLUMN IF NOT EXISTS pending_upgrade_at TIMESTAMP;
+                ALTER TABLE pairs ADD COLUMN IF NOT EXISTS pending_upgrade_at TIMESTAMP;
             """)
             cur.execute("""
-                ALTER TABLE pairs
-                ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMP;
+                ALTER TABLE pairs ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMP;
             """)
             cur.execute("""
-                ALTER TABLE pairs
-                ADD COLUMN IF NOT EXISTS trial_notified BOOLEAN DEFAULT FALSE;
+                ALTER TABLE pairs ADD COLUMN IF NOT EXISTS trial_notified BOOLEAN DEFAULT FALSE;
             """)
             cur.execute("""
-                ALTER TABLE surprises
-                ADD COLUMN IF NOT EXISTS recipient_id BIGINT REFERENCES users(user_id);
+                ALTER TABLE surprises ADD COLUMN IF NOT EXISTS recipient_id BIGINT REFERENCES users(user_id);
+            """)
+            cur.execute("""
+                ALTER TABLE surprises ADD COLUMN IF NOT EXISTS release_datetime TIMESTAMP;
+            """)
+            cur.execute("""
+                ALTER TABLE surprises ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending';
+            """)
+            # Backfill release_datetime for existing surprises: use 9am on the scheduled date
+            cur.execute("""
+                UPDATE surprises
+                SET release_datetime = scheduled_date::timestamp + TIME '09:00:00'
+                WHERE release_datetime IS NULL;
+            """)
+            # Backfill status
+            cur.execute("""
+                UPDATE surprises SET status = 'delivered' WHERE is_opened = TRUE AND (status IS NULL OR status = 'pending');
+            """)
+            cur.execute("""
+                UPDATE surprises SET status = 'pending' WHERE status IS NULL;
             """)
         _conn.commit()
     finally:
@@ -300,6 +320,48 @@ def get_surprise_for_date(pair_id: int, creator_id: int, scheduled_date: date):
         release_db(conn)
 
 
+def get_surprise_by_id(surprise_id: int):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT s.*,
+                       u.first_name AS creator_name,
+                       r.first_name AS recipient_name
+                FROM surprises s
+                JOIN users u ON u.user_id = s.creator_id
+                LEFT JOIN users r ON r.user_id = s.recipient_id
+                WHERE s.id = %s
+                """,
+                (surprise_id,),
+            )
+            return cur.fetchone()
+    finally:
+        release_db(conn)
+
+
+def get_all_pending_surprises():
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT s.*,
+                       u.first_name AS creator_name,
+                       r.first_name AS recipient_name
+                FROM surprises s
+                JOIN users u ON u.user_id = s.creator_id
+                LEFT JOIN users r ON r.user_id = s.recipient_id
+                WHERE s.status = 'pending'
+                  AND s.release_datetime IS NOT NULL
+                """
+            )
+            return cur.fetchall()
+    finally:
+        release_db(conn)
+
+
 def get_todays_surprises_for_user(user_id: int, today: date):
     conn = get_db()
     try:
@@ -357,6 +419,7 @@ def save_surprise(
     caption: str | None = None,
     text_content: str | None = None,
     recipient_id: int | None = None,
+    release_datetime: datetime | None = None,
 ) -> int:
     conn = get_db()
     try:
@@ -364,19 +427,23 @@ def save_surprise(
             cur.execute(
                 """
                 INSERT INTO surprises
-                    (pair_id, creator_id, scheduled_date, media_type, file_id, caption, text_content, recipient_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    (pair_id, creator_id, scheduled_date, release_datetime,
+                     media_type, file_id, caption, text_content, recipient_id, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')
                 ON CONFLICT (pair_id, creator_id, scheduled_date) DO UPDATE SET
-                    media_type   = EXCLUDED.media_type,
-                    file_id      = EXCLUDED.file_id,
-                    caption      = EXCLUDED.caption,
-                    text_content = EXCLUDED.text_content,
-                    recipient_id = EXCLUDED.recipient_id,
-                    is_opened    = FALSE,
-                    opened_at    = NULL
+                    release_datetime = EXCLUDED.release_datetime,
+                    media_type       = EXCLUDED.media_type,
+                    file_id          = EXCLUDED.file_id,
+                    caption          = EXCLUDED.caption,
+                    text_content     = EXCLUDED.text_content,
+                    recipient_id     = EXCLUDED.recipient_id,
+                    status           = 'pending',
+                    is_opened        = FALSE,
+                    opened_at        = NULL
                 RETURNING id
                 """,
-                (pair_id, creator_id, scheduled_date, media_type, file_id, caption, text_content, recipient_id),
+                (pair_id, creator_id, scheduled_date, release_datetime,
+                 media_type, file_id, caption, text_content, recipient_id),
             )
             row = cur.fetchone()
         conn.commit()
@@ -390,7 +457,46 @@ def mark_surprise_opened(surprise_id: int):
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE surprises SET is_opened = TRUE, opened_at = NOW() WHERE id = %s",
+                "UPDATE surprises SET is_opened = TRUE, opened_at = NOW(), status = 'delivered' WHERE id = %s",
+                (surprise_id,),
+            )
+        conn.commit()
+    finally:
+        release_db(conn)
+
+
+def mark_surprise_delivered(surprise_id: int):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE surprises SET is_opened = TRUE, opened_at = NOW(), status = 'delivered' WHERE id = %s",
+                (surprise_id,),
+            )
+        conn.commit()
+    finally:
+        release_db(conn)
+
+
+def mark_surprise_dismissed(surprise_id: int):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE surprises SET status = 'dismissed' WHERE id = %s",
+                (surprise_id,),
+            )
+        conn.commit()
+    finally:
+        release_db(conn)
+
+
+def mark_surprise_overdue_pending(surprise_id: int):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE surprises SET status = 'overdue_pending' WHERE id = %s",
                 (surprise_id,),
             )
         conn.commit()
@@ -441,7 +547,7 @@ def get_creator_surprises(pair_id: int, creator_id: int):
                 FROM surprises s
                 LEFT JOIN users u ON u.user_id = s.recipient_id
                 WHERE s.pair_id = %s AND s.creator_id = %s
-                ORDER BY s.scheduled_date ASC
+                ORDER BY COALESCE(s.release_datetime, s.scheduled_date::timestamp) ASC
                 """,
                 (pair_id, creator_id),
             )
@@ -460,7 +566,7 @@ def get_inbound_surprises_for_user(pair_id: int, user_id: int):
                 WHERE pair_id = %s
                   AND creator_id != %s
                   AND (recipient_id = %s OR recipient_id IS NULL)
-                ORDER BY scheduled_date ASC
+                ORDER BY COALESCE(release_datetime, scheduled_date::timestamp) ASC
                 """,
                 (pair_id, user_id, user_id),
             )
@@ -528,12 +634,24 @@ def trial_days_remaining(pair) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Calendar UI
+# Calendar UI & formatting helpers
 # ---------------------------------------------------------------------------
 
 def friendly_date(d: date) -> str:
     fmt = "%A %#d %B" if platform.system() == "Windows" else "%A %-d %B"
     return d.strftime(fmt)
+
+
+def friendly_datetime(dt: datetime) -> str:
+    fmt = "%A %#d %B" if platform.system() == "Windows" else "%A %-d %B"
+    time_str = dt.strftime("%I:%M %p").lstrip("0")
+    return f"{dt.strftime(fmt)} at {time_str}"
+
+
+def _format_surprise_label(s) -> str:
+    if s.get("release_datetime"):
+        return friendly_datetime(s["release_datetime"])
+    return friendly_date(s["scheduled_date"])
 
 
 def build_calendar(year: int, month: int) -> InlineKeyboardMarkup:
@@ -576,6 +694,27 @@ def escape_md(text: str) -> str:
     return "".join(f"\\{c}" if c in special else c for c in str(text))
 
 
+def parse_time_input(text: str) -> tuple[int, int] | None:
+    text = text.strip()
+    m = re.fullmatch(r'(\d{1,2})[:\.](\d{2})', text)
+    if m:
+        h, mn = int(m.group(1)), int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mn <= 59:
+            return h, mn
+    m = re.fullmatch(r'(\d{1,2})(?:[:\.](\d{2}))?\s*(AM|PM)', text, re.IGNORECASE)
+    if m:
+        h = int(m.group(1))
+        mn = int(m.group(2)) if m.group(2) else 0
+        ampm = m.group(3).upper()
+        if ampm == "PM" and h != 12:
+            h += 12
+        elif ampm == "AM" and h == 12:
+            h = 0
+        if 0 <= h <= 23 and 0 <= mn <= 59:
+            return h, mn
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Media delivery helpers
 # ---------------------------------------------------------------------------
@@ -606,8 +745,21 @@ async def deliver_surprise(chat_id: int, surprise, bot: Bot):
         await bot.send_video_note(chat_id, file_id)
 
 
-async def forward_reaction(creator_id: int, media_type: str, file_id: str | None, text_content: str | None, bot: Bot):
-    await bot.send_message(creator_id, "They reacted. I thought you'd want to know.")
+async def forward_reaction(
+    creator_id: int,
+    media_type: str,
+    file_id: str | None,
+    text_content: str | None,
+    bot: Bot,
+    reactor_name: str | None = None,
+    surprise_dt: datetime | None = None,
+):
+    if reactor_name and surprise_dt:
+        dt_str = friendly_datetime(surprise_dt)
+        await bot.send_message(creator_id, f"{reactor_name} reacted to your surprise from {dt_str} 💌")
+    else:
+        await bot.send_message(creator_id, "They reacted. I thought you'd want to know.")
+
     if media_type == "text":
         await bot.send_message(creator_id, text_content)
     elif media_type == "photo":
@@ -784,23 +936,6 @@ async def cmd_load(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def _show_recipient_picker_or_proceed(query, context, pair, user_id) -> None:
-    others = get_pair_members(pair["id"], exclude_user=user_id)
-    if len(others) == 1:
-        context.user_data["pending_recipient_id"] = others[0]["user_id"]
-        context.user_data["awaiting_content"] = True
-        await query.edit_message_text("Good choice. Now send me what you want to leave.")
-    else:
-        buttons = [
-            [InlineKeyboardButton(m["first_name"], callback_data=f"recipient_{m['user_id']}")]
-            for m in others
-        ]
-        await query.edit_message_text(
-            "Who is this for?",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-
-
 async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -811,7 +946,9 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "cal_cancel":
         context.user_data.pop("awaiting_content", None)
+        context.user_data.pop("awaiting_time", None)
         context.user_data.pop("pending_date", None)
+        context.user_data.pop("pending_time", None)
         context.user_data.pop("pending_recipient_id", None)
         await query.edit_message_text("Cancelled.")
         return
@@ -851,7 +988,33 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=keyboard,
             )
         else:
-            await _show_recipient_picker_or_proceed(query, context, pair, user.id)
+            context.user_data["awaiting_time"] = True
+            await query.edit_message_text(
+                f"What time should this arrive on {friendly_date(chosen)}?\n\n"
+                "Reply with a time like 14:30 or 2:30 PM.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("‹ Back", callback_data="time_back"),
+                ]]),
+            )
+
+
+async def time_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("awaiting_time", None)
+    pending_date_str = context.user_data.pop("pending_date", None)
+    if pending_date_str:
+        d = date.fromisoformat(pending_date_str)
+        await query.edit_message_text(
+            "Pick a date.",
+            reply_markup=build_calendar(d.year, d.month),
+        )
+    else:
+        today = date.today()
+        await query.edit_message_text(
+            "Pick a date.",
+            reply_markup=build_calendar(today.year, today.month),
+        )
 
 
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -860,14 +1023,22 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "confirm_keep":
         context.user_data.pop("pending_date", None)
+        context.user_data.pop("pending_time", None)
         context.user_data.pop("pending_recipient_id", None)
         await query.edit_message_text("Kept as it was.")
         return
 
     if query.data == "confirm_replace":
-        user = update.effective_user
-        pair = get_user_pair(user.id)
-        await _show_recipient_picker_or_proceed(query, context, pair, user.id)
+        pending_date_str = context.user_data.get("pending_date")
+        chosen = date.fromisoformat(pending_date_str)
+        context.user_data["awaiting_time"] = True
+        await query.edit_message_text(
+            f"What time should this arrive on {friendly_date(chosen)}?\n\n"
+            "Reply with a time like 14:30 or 2:30 PM.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("‹ Back", callback_data="time_back"),
+            ]]),
+        )
 
 
 async def recipient_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -877,6 +1048,37 @@ async def recipient_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["pending_recipient_id"] = recipient_id
     context.user_data["awaiting_content"] = True
     await query.edit_message_text("Good choice. Now send me what you want to leave.")
+
+
+async def overdue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    # Pattern: overdue_deliver_123 or overdue_dismiss_123
+    parts = query.data.split("_")
+    action = parts[1]
+    surprise_id = int(parts[2])
+
+    try:
+        _scheduler.remove_job(f"auto_dismiss_{surprise_id}")
+    except Exception:
+        pass
+
+    if action == "deliver":
+        surprise = get_surprise_by_id(surprise_id)
+        if not surprise:
+            await query.edit_message_text("Not found.")
+            return
+        recipient_id = surprise["recipient_id"]
+        if recipient_id:
+            try:
+                await deliver_surprise(recipient_id, surprise, context.bot)
+            except Exception as e:
+                logger.error("Failed to deliver overdue surprise %d: %s", surprise_id, e)
+        mark_surprise_delivered(surprise_id)
+        await query.edit_message_text("Delivered.")
+    elif action == "dismiss":
+        mark_surprise_dismissed(surprise_id)
+        await query.edit_message_text("Dismissed. It won't be sent.")
 
 
 async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -960,11 +1162,11 @@ async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for s in surprises:
         d = s["scheduled_date"]
-        label = friendly_date(d)
+        label = escape_md(_format_surprise_label(s))
         if s["is_opened"] or d <= today:
-            lines.append(f"✅ {escape_md(label)}")
+            lines.append(f"✅ {label}")
         else:
-            lines.append(f"||{escape_md(label)}||")
+            lines.append(f"||{label}||")
 
     await update.message.reply_text(
         "\n".join(lines),
@@ -1002,26 +1204,25 @@ async def cmd_outbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    today = date.today()
-    upcoming = [s for s in surprises if s["scheduled_date"] > today and not s["is_opened"]]
-    delivered = [s for s in surprises if s["is_opened"] or s["scheduled_date"] <= today]
+    upcoming = [s for s in surprises if s.get("status") in ("pending", "overdue_pending")]
+    delivered = [s for s in surprises if s.get("status") == "delivered"]
     multi_member = len(partners) > 1
 
     lines = [f"Here's what you've left for {partner_name}.", ""]
 
     for s in upcoming:
-        label = friendly_date(s["scheduled_date"])
+        label = _format_surprise_label(s)
         kind = _MEDIA_LABEL.get(s["media_type"], s["media_type"])
         if multi_member and s.get("recipient_name"):
-            lines.append(f"{label} — {kind} → {s['recipient_name']}")
+            lines.append(f"🔒 {label} — {kind} → {s['recipient_name']}")
         else:
-            lines.append(f"{label} — {kind}")
+            lines.append(f"🔒 {label} — {kind}")
 
     if delivered:
         if upcoming:
             lines.append("")
         for s in delivered:
-            label = friendly_date(s["scheduled_date"])
+            label = _format_surprise_label(s)
             lines.append(f"✅ {label} — delivered")
 
     await update.message.reply_text("\n".join(lines))
@@ -1087,7 +1288,6 @@ async def cmd_testinvite(update: Update, context: ContextTypes.DEFAULT_TYPE):
         count = 1
 
     today = date.today()
-    # Pick `count` unique random offsets in [2, 60]
     offsets = random.sample(range(2, 61), count)
     surprise_dates = [today + timedelta(days=d) for d in offsets]
 
@@ -1111,14 +1311,16 @@ async def cmd_testinvite(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     """,
                     (pair["id"], fake_id),
                 )
+                release_dt = datetime(surprise_date.year, surprise_date.month, surprise_date.day, 9, 0)
                 cur.execute(
                     """
                     INSERT INTO surprises
-                        (pair_id, creator_id, scheduled_date, media_type, text_content, recipient_id)
-                    VALUES (%s, %s, %s, 'text', %s, %s)
+                        (pair_id, creator_id, scheduled_date, release_datetime,
+                         media_type, text_content, recipient_id, status)
+                    VALUES (%s, %s, %s, %s, 'text', %s, %s, 'pending')
                     ON CONFLICT (pair_id, creator_id, scheduled_date) DO NOTHING
                     """,
-                    (pair["id"], fake_id, surprise_date, fake_text, user.id),
+                    (pair["id"], fake_id, surprise_date, release_dt, fake_text, user.id),
                 )
         conn.commit()
     finally:
@@ -1278,7 +1480,6 @@ async def cmd_testopensender(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
         mark_surprise_opened(surprise["id"])
-        # Always deliver to the sender in dev mode — recipient may be a fake user
         await deliver_surprise(update.message.chat_id, surprise, context.bot)
     except Exception as e:
         logger.error("testopensender error:\n%s", traceback.format_exc())
@@ -1375,7 +1576,6 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 def _extract_media(msg):
-    """Return (media_type, file_id) or (None, None) if no recognised media."""
     if msg.photo:
         return "photo", msg.photo[-1].file_id
     if msg.audio:
@@ -1390,10 +1590,67 @@ def _extract_media(msg):
 
 
 async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("awaiting_content"):
+    if context.user_data.get("awaiting_time"):
+        await _handle_time_input(update, context)
+    elif context.user_data.get("awaiting_content"):
         await _handle_content(update, context)
     elif context.user_data.get("awaiting_reaction_for"):
         await _handle_reaction(update, context)
+
+
+async def _handle_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    text = (msg.text or "").strip()
+
+    if text.lower() == "cancel":
+        context.user_data.pop("awaiting_time", None)
+        context.user_data.pop("pending_date", None)
+        await msg.reply_text("Cancelled.")
+        return
+
+    back_button = InlineKeyboardMarkup([[InlineKeyboardButton("‹ Back", callback_data="time_back")]])
+    parsed = parse_time_input(text)
+
+    if parsed is None:
+        await msg.reply_text(
+            "I didn't catch that. Reply with a time like 14:30 or 2:30 PM.",
+            reply_markup=back_button,
+        )
+        return
+
+    hour, minute = parsed
+    pending_date_str = context.user_data.get("pending_date")
+    chosen_date = date.fromisoformat(pending_date_str)
+    now_prague = datetime.now(PRAGUE)
+
+    if chosen_date == now_prague.date():
+        release_dt_aware = datetime(
+            chosen_date.year, chosen_date.month, chosen_date.day, hour, minute, tzinfo=PRAGUE
+        )
+        if release_dt_aware <= now_prague + timedelta(minutes=30):
+            await msg.reply_text(
+                "That time has already passed. Pick a time at least 30 minutes from now.",
+                reply_markup=back_button,
+            )
+            return
+
+    context.user_data["pending_time"] = f"{hour:02d}:{minute:02d}"
+    context.user_data.pop("awaiting_time", None)
+
+    user = update.effective_user
+    pair = get_user_pair(user.id)
+    others = get_pair_members(pair["id"], exclude_user=user.id)
+
+    if len(others) == 1:
+        context.user_data["pending_recipient_id"] = others[0]["user_id"]
+        context.user_data["awaiting_content"] = True
+        await msg.reply_text("Good choice. Now send me what you want to leave.")
+    else:
+        buttons = [
+            [InlineKeyboardButton(m["first_name"], callback_data=f"recipient_{m['user_id']}")]
+            for m in others
+        ]
+        await msg.reply_text("Who is this for?", reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def _handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1407,6 +1664,10 @@ async def _handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     pending_date = date.fromisoformat(pending_date_str)
+    pending_time_str = context.user_data.get("pending_time", "09:00")
+    hour, minute = map(int, pending_time_str.split(":"))
+    release_dt = datetime(pending_date.year, pending_date.month, pending_date.day, hour, minute)
+
     msg = update.message
     is_plus = is_plus_or_trial(pair)
 
@@ -1429,7 +1690,10 @@ async def _handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     recipient_id = context.user_data.get("pending_recipient_id")
-    save_surprise(pair["id"], user.id, pending_date, media_type, file_id, caption, text_content, recipient_id)
+    surprise_id = save_surprise(
+        pair["id"], user.id, pending_date, media_type, file_id, caption, text_content,
+        recipient_id, release_datetime=release_dt,
+    )
 
     if recipient_id:
         members = get_pair_members(pair["id"], exclude_user=user.id)
@@ -1439,13 +1703,23 @@ async def _handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
         others = get_pair_members(pair["id"], exclude_user=user.id)
         recipient_name = others[0]["first_name"] if others else "them"
 
+    logger.info("Scheduled surprise %d for %s to %s", surprise_id, release_dt, recipient_name)
+    _scheduler.add_job(
+        _deliver_surprise_job, "date",
+        run_date=release_dt,
+        args=[surprise_id, context.bot],
+        id=f"surprise_{surprise_id}",
+        replace_existing=True,
+    )
+
     context.user_data.pop("awaiting_content", None)
     context.user_data.pop("pending_date", None)
+    context.user_data.pop("pending_time", None)
     context.user_data.pop("pending_recipient_id", None)
 
+    dt_str = friendly_datetime(release_dt)
     await msg.reply_text(
-        f"Locked away. {recipient_name} will receive it on "
-        f"{friendly_date(pending_date)}. I won't say a word. 🔒"
+        f"Locked away. {recipient_name} will receive it on {dt_str}. I won't say a word. 🔒"
     )
 
 
@@ -1466,19 +1740,106 @@ async def _handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_reaction(surprise_id, user.id, media_type, file_id, text_content)
     context.user_data.pop("awaiting_reaction_for", None)
 
-    creator_id = get_surprise_creator(surprise_id)
+    surprise = get_surprise_by_id(surprise_id)
+    creator_id = surprise["creator_id"] if surprise else None
     if creator_id:
         try:
-            await forward_reaction(creator_id, media_type, file_id, text_content, context.bot)
+            await forward_reaction(
+                creator_id, media_type, file_id, text_content, context.bot,
+                reactor_name=user.first_name,
+                surprise_dt=surprise.get("release_datetime") if surprise else None,
+            )
         except Exception as e:
-            logger.error(f"Failed to forward reaction to {creator_id}: {e}")
+            logger.error("Failed to forward reaction to %s: %s", creator_id, e)
 
     await msg.reply_text("Delivered.")
 
 
 # ---------------------------------------------------------------------------
-# Scheduler
+# Scheduler jobs
 # ---------------------------------------------------------------------------
+
+async def _deliver_surprise_job(surprise_id: int, bot: Bot):
+    surprise = get_surprise_by_id(surprise_id)
+    if not surprise or surprise["status"] != "pending":
+        return
+    recipient_id = surprise["recipient_id"]
+    if not recipient_id:
+        logger.error("Surprise %d has no recipient_id — cannot deliver", surprise_id)
+        return
+    recipient_name = surprise.get("recipient_name") or "recipient"
+    logger.info("Delivering surprise %d to %s", surprise_id, recipient_name)
+    try:
+        await deliver_surprise(recipient_id, surprise, bot)
+        mark_surprise_delivered(surprise_id)
+    except Exception as e:
+        logger.error("Failed to deliver surprise %d: %s", surprise_id, e)
+
+
+async def _auto_dismiss_overdue(surprise_id: int):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM surprises WHERE id = %s", (surprise_id,))
+            row = cur.fetchone()
+    finally:
+        release_db(conn)
+    if row and row["status"] == "overdue_pending":
+        mark_surprise_dismissed(surprise_id)
+        logger.info("Auto-dismissed overdue surprise %d after 48h", surprise_id)
+
+
+async def _reschedule_on_startup(bot: Bot):
+    all_pending = get_all_pending_surprises()
+    now = datetime.now(PRAGUE).replace(tzinfo=None)
+
+    future = [s for s in all_pending if s["release_datetime"] > now]
+    overdue = [s for s in all_pending if s["release_datetime"] <= now]
+
+    for s in future:
+        _scheduler.add_job(
+            _deliver_surprise_job, "date",
+            run_date=s["release_datetime"],
+            args=[s["id"], bot],
+            id=f"surprise_{s['id']}",
+            replace_existing=True,
+        )
+
+    logger.info("Rescheduled %d pending surprises on startup", len(future))
+
+    for s in overdue:
+        logger.info(
+            "Found overdue surprise %d for %s originally due %s — notifying sender",
+            s["id"], s.get("recipient_name", "unknown"), s["release_datetime"],
+        )
+        mark_surprise_overdue_pending(s["id"])
+        recipient_name = s.get("recipient_name") or "your partner"
+        due_str = friendly_datetime(s["release_datetime"])
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Deliver now", callback_data=f"overdue_deliver_{s['id']}"),
+            InlineKeyboardButton("Dismiss", callback_data=f"overdue_dismiss_{s['id']}"),
+        ]])
+        try:
+            await bot.send_message(
+                s["creator_id"],
+                f"Something I was holding for {recipient_name} was meant to arrive on "
+                f"{due_str} but I wasn't able to deliver it in time.\n\n"
+                "What would you like me to do?",
+                reply_markup=keyboard,
+            )
+            _scheduler.add_job(
+                _auto_dismiss_overdue, "date",
+                run_date=now + timedelta(hours=48),
+                args=[s["id"]],
+                id=f"auto_dismiss_{s['id']}",
+                replace_existing=True,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to notify sender %s about overdue surprise %d: %s",
+                s["creator_id"], s["id"], e,
+            )
+
 
 async def _check_expired_trials(bot: Bot):
     expired_pair_ids = []
@@ -1526,41 +1887,6 @@ async def _check_expired_trials(bot: Bot):
                 logger.error("Failed to notify %s of trial expiry: %s", m["user_id"], e)
 
 
-async def daily_check(bot: Bot):
-    today = date.today()
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT DISTINCT pm.user_id, u.first_name AS sender_name
-                FROM pair_members pm
-                JOIN surprises s ON s.pair_id = pm.pair_id
-                JOIN users u ON u.user_id = s.creator_id
-                WHERE s.scheduled_date = %s
-                  AND s.creator_id != pm.user_id
-                  AND s.is_opened = FALSE
-                  AND (s.recipient_id = pm.user_id OR s.recipient_id IS NULL)
-                """,
-                (today,),
-            )
-            recipients = cur.fetchall()
-    finally:
-        release_db(conn)
-
-    for r in recipients:
-        try:
-            sender = r["sender_name"] or "Someone"
-            await bot.send_message(
-                r["user_id"],
-                f"{sender} left something for you. Use /open when you're ready.",
-            )
-        except Exception as e:
-            logger.error(f"Failed to notify {r['user_id']}: {e}")
-
-    await _check_expired_trials(bot)
-
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1586,8 +1912,10 @@ def _build_tg_app() -> Application:
     app.add_handler(CommandHandler("devhelp", cmd_devhelp, filters=_dev))  # DEV ONLY
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal_"))
+    app.add_handler(CallbackQueryHandler(time_back_callback, pattern=r"^time_back$"))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm_"))
     app.add_handler(CallbackQueryHandler(recipient_callback, pattern=r"^recipient_"))
+    app.add_handler(CallbackQueryHandler(overdue_callback, pattern=r"^overdue_"))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.AUDIO | filters.VOICE |
          filters.VIDEO | filters.VIDEO_NOTE) & ~filters.COMMAND,
@@ -1598,6 +1926,7 @@ def _build_tg_app() -> Application:
 
 
 async def _run() -> None:
+    global _scheduler
     tg_app = _build_tg_app()
 
     # Webhook server
@@ -1609,10 +1938,10 @@ async def _run() -> None:
     await aiohttp.web.TCPSite(runner, "0.0.0.0", PORT).start()
     logger.info("Webhook server listening on port %d", PORT)
 
-    # Scheduler
-    scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(daily_check, "cron", hour=9, minute=0, args=[tg_app.bot])
-    scheduler.start()
+    # Scheduler — Prague timezone so naive run_dates are treated as local time
+    _scheduler = AsyncIOScheduler(timezone="Europe/Prague")
+    _scheduler.add_job(_check_expired_trials, "cron", hour=9, minute=0, args=[tg_app.bot])
+    _scheduler.start()
 
     # Register BotFather commands
     await tg_app.bot.set_my_commands([
@@ -1637,6 +1966,7 @@ async def _run() -> None:
 
     async with tg_app:
         await tg_app.start()
+        await _reschedule_on_startup(tg_app.bot)
         await tg_app.updater.start_polling(drop_pending_updates=True)
         logger.info("Margot is ready.")
         try:
@@ -1647,7 +1977,7 @@ async def _run() -> None:
             await tg_app.updater.stop()
             await tg_app.stop()
 
-    scheduler.shutdown(wait=False)
+    _scheduler.shutdown(wait=False)
     await runner.cleanup()
 
 
