@@ -1528,6 +1528,27 @@ async def cmd_testopenreceiver(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # DEV ONLY - remove before launch
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM reactions")
+            cur.execute("DELETE FROM surprises")
+            cur.execute("DELETE FROM invites")
+            cur.execute("DELETE FROM pair_members")
+            cur.execute("DELETE FROM pairs")
+            cur.execute("DELETE FROM users")
+        conn.commit()
+    finally:
+        release_db(conn)
+
+    for job in _scheduler.get_jobs():
+        job.remove()
+
+    await update.message.reply_text("Done. Everything is gone. Start over with /start.")
+
+
+# DEV ONLY - remove before launch
 async def cmd_devhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Dev commands.\n\n"
@@ -1539,7 +1560,8 @@ async def cmd_devhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/testtrial status — show trial state\n"
         "/testopensender — deliver your next loaded surprise now\n"
         "/testopenreceiver — receive your next incoming surprise now\n"
-        "/devhelp — show this list"
+        "/devhelp — show this list\n"
+        "/reset — wipe everything and start fresh"
     )
 
 
@@ -1910,6 +1932,7 @@ def _build_tg_app() -> Application:
     app.add_handler(CommandHandler("testopensender", cmd_testopensender, filters=_dev))  # DEV ONLY
     app.add_handler(CommandHandler("testopenreceiver", cmd_testopenreceiver, filters=_dev))  # DEV ONLY
     app.add_handler(CommandHandler("devhelp", cmd_devhelp, filters=_dev))  # DEV ONLY
+    app.add_handler(CommandHandler("reset", cmd_reset, filters=_dev))  # DEV ONLY
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal_"))
     app.add_handler(CallbackQueryHandler(time_back_callback, pattern=r"^time_back$"))
