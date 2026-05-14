@@ -676,7 +676,7 @@ def build_calendar(year: int, month: int) -> InlineKeyboardMarkup:
                 row.append(InlineKeyboardButton(" ", callback_data="cal_noop"))
             else:
                 d = date(year, month, day)
-                if d <= today:
+                if d < today:
                     row.append(InlineKeyboardButton("·", callback_data="cal_noop"))
                 else:
                     row.append(InlineKeyboardButton(
