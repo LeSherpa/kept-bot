@@ -8,7 +8,7 @@ import signal
 import time
 import traceback
 import uuid
-from calendar import monthcalendar, month_name
+from calendar import monthcalendar, month_name, monthrange
 from datetime import date, datetime, timedelta
 from urllib.parse import urlencode, urlparse, urlunparse
 from zoneinfo import ZoneInfo
@@ -47,6 +47,68 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 PORT = int(os.getenv("PORT", "8080"))
 
 PRAGUE = ZoneInfo("Europe/Prague")
+
+MARGOT = {
+    "start": (
+        "Oh, you found me. Good.\n\n"
+        "I'm Margot. I keep things safe until the moment is right.\n\n"
+        "Use /invite to bring someone into your Kept, "
+        "then /load to leave them something.\n\n"
+        "When your partner joins, you'll both get 7 days of Plus free. 🔑"
+    ),
+    "join_invite": (
+        "You've joined {inviter_name}'s Kept. I'm Margot.\n\n"
+        "I hold things here until the right moment. Use /load to leave something."
+    ),
+    "trial_start": (
+        "You have 7 days of Plus to explore everything. "
+        "After that, the surprises stay — only new media uploads require a subscription. 🔑"
+    ),
+    "load_confirm": "Locked away. {recipient_name} will receive it on {dt_str}. I won't say a word. 🔒",
+    "calendar_empty": (
+        "Nothing waiting for you yet, {name}.\n"
+        "I'm sure {partner_name} has something up their sleeve. 💌"
+    ),
+    "deliver_intro": "{sender_name} left this for you. 💌",
+    "reaction_forwarded": "{reactor_name} reacted to your surprise from {dt_str} 💌",
+    "reaction_saved": "Delivered.",
+    "payment_received": "Payment received. Plus is yours. Don't waste it. 🔑",
+    "partner_upgraded": "{user_name} just unlocked Plus. You both have it now. 🔑",
+    "already_plus": "You're already on Plus. Margot approves.",
+    "trial_expired": (
+        "Your Plus trial has ended. Everything you loaded is still here — "
+        "only new media uploads require a subscription."
+    ),
+    "overdue_notification": (
+        "Something I was holding for {recipient_name} was meant to arrive on "
+        "{due_str} but I wasn't able to deliver it in time.\n\nWhat would you like me to do?"
+    ),
+    "not_yet": "Not yet. {days} {day_word} to go.",
+    "nothing_today": "Nothing here for today.",
+    "await_reaction": "Send me your reaction — emoji, words, a voice note. Or skip with /calendar.",
+    "inactivity": [
+        "It's been a while since I kept a surprise for {partner_name}. Any ideas? 💅",
+        "{partner_name}'s calendar is looking empty on my end. Just saying. 💅",
+        "Nothing new from you lately, {name}. I have room for a surprise if you do. ✨",
+    ],
+    "milestone_first_load": [
+        "First one in. I'll keep it safe until the moment is right. 🔒",
+    ],
+    "milestone_first_open": [
+        "There it is. That's what I'm here for. 💌",
+        "First one delivered. I hope it landed well. 💛",
+    ],
+    "milestone_first_reaction": [
+        "They reacted. That means it worked. ✨",
+    ],
+    "milestone_tenth": [
+        "Ten surprises between the two of you. I've been busy. 💅",
+        "That's ten. You're getting good at this. ✨",
+    ],
+    "milestone_monthly": [
+        "A month of keeping your secrets. I don't mind. 💌",
+    ],
+}
 
 _pool: psycopg2.pool.SimpleConnectionPool | None = None
 _scheduler: AsyncIOScheduler | None = None
@@ -142,6 +204,33 @@ def init_db():
             """)
             cur.execute("""
                 ALTER TABLE pairs ADD COLUMN IF NOT EXISTS trial_notified BOOLEAN DEFAULT FALSE;
+            """)
+            cur.execute("""
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS last_nudge_sent_at TIMESTAMP;
+            """)
+            cur.execute("""
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS consecutive_nudges INTEGER DEFAULT 0;
+            """)
+            cur.execute("""
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMP;
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS milestones (
+                    id             SERIAL PRIMARY KEY,
+                    pair_id        INTEGER REFERENCES pairs(id),
+                    milestone_name TEXT NOT NULL,
+                    fired_at       TIMESTAMP DEFAULT NOW(),
+                    UNIQUE (pair_id, milestone_name)
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS proactive_queue (
+                    id         SERIAL PRIMARY KEY,
+                    user_id    BIGINT REFERENCES users(user_id),
+                    message    TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    sent       BOOLEAN DEFAULT FALSE
+                );
             """)
             cur.execute("""
                 ALTER TABLE surprises ADD COLUMN IF NOT EXISTS recipient_id BIGINT REFERENCES users(user_id);
@@ -616,6 +705,126 @@ def payment_link_for_user(user_id: int, link: str) -> str:
     return urlunparse(parsed._replace(query=query))
 
 
+def update_user_activity(user_id: int):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET last_activity_at = NOW(), consecutive_nudges = 0 WHERE user_id = %s",
+                (user_id,),
+            )
+        conn.commit()
+    finally:
+        release_db(conn)
+
+
+def update_nudge_sent(user_id: int):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE users
+                SET last_nudge_sent_at = NOW(),
+                    consecutive_nudges = COALESCE(consecutive_nudges, 0) + 1
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+        conn.commit()
+    finally:
+        release_db(conn)
+
+
+def has_milestone_fired(pair_id: int, milestone_name: str) -> bool:
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM milestones WHERE pair_id = %s AND milestone_name = %s",
+                (pair_id, milestone_name),
+            )
+            return cur.fetchone() is not None
+    finally:
+        release_db(conn)
+
+
+def record_milestone(pair_id: int, milestone_name: str) -> bool:
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO milestones (pair_id, milestone_name)
+                VALUES (%s, %s)
+                ON CONFLICT (pair_id, milestone_name) DO NOTHING
+                """,
+                (pair_id, milestone_name),
+            )
+            inserted = cur.rowcount > 0
+        conn.commit()
+        return inserted
+    finally:
+        release_db(conn)
+
+
+def queue_proactive_message(user_id: int, message: str):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO proactive_queue (user_id, message) VALUES (%s, %s)",
+                (user_id, message),
+            )
+        conn.commit()
+    finally:
+        release_db(conn)
+
+
+def flush_proactive_queue() -> list:
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, user_id, message FROM proactive_queue WHERE sent = FALSE ORDER BY created_at ASC"
+            )
+            rows = cur.fetchall()
+            if rows:
+                ids = [r["id"] for r in rows]
+                cur.execute("UPDATE proactive_queue SET sent = TRUE WHERE id = ANY(%s)", (ids,))
+        conn.commit()
+        return rows
+    finally:
+        release_db(conn)
+
+
+def get_pair_delivered_count(pair_id: int) -> int:
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM surprises WHERE pair_id = %s AND status = 'delivered'",
+                (pair_id,),
+            )
+            return cur.fetchone()["cnt"]
+    finally:
+        release_db(conn)
+
+
+def get_pair_first_surprise_date(pair_id: int):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT MIN(scheduled_date) AS first_date FROM surprises WHERE pair_id = %s",
+                (pair_id,),
+            )
+            row = cur.fetchone()
+            return row["first_date"] if row else None
+    finally:
+        release_db(conn)
+
+
 def is_plus_or_trial(pair) -> bool:
     if pair["subscription_tier"] == "plus":
         return True
@@ -631,6 +840,48 @@ def trial_days_remaining(pair) -> int:
         return 0
     delta = trial_start + timedelta(days=7) - datetime.now()
     return max(0, delta.days)
+
+
+# ---------------------------------------------------------------------------
+# Quiet hours & proactive messaging
+# ---------------------------------------------------------------------------
+
+def is_quiet_hours() -> bool:
+    h = datetime.now(PRAGUE).hour
+    return h >= 22 or h < 8
+
+
+async def send_proactive(bot: Bot, user_id: int, message: str):
+    if is_quiet_hours():
+        queue_proactive_message(user_id, message)
+    else:
+        await bot.send_message(user_id, message)
+
+
+def one_month_after(d: date) -> date:
+    month = d.month + 1
+    year = d.year
+    if month > 12:
+        month, year = 1, year + 1
+    max_day = monthrange(year, month)[1]
+    return d.replace(year=year, month=month, day=min(d.day, max_day))
+
+
+async def check_and_fire_milestone(
+    bot: Bot,
+    pair_id: int,
+    milestone_name: str,
+    message: str,
+    user_ids: list[int],
+):
+    if not record_milestone(pair_id, milestone_name):
+        return
+    for uid in user_ids:
+        if uid and uid > 0:
+            try:
+                await send_proactive(bot, uid, message)
+            except Exception as e:
+                logger.error("Failed to send milestone %s to %d: %s", milestone_name, uid, e)
 
 
 # ---------------------------------------------------------------------------
@@ -724,7 +975,7 @@ async def deliver_surprise(chat_id: int, surprise, bot: Bot):
     file_id = surprise.get("file_id")
     caption = surprise.get("caption") or ""
     sender = surprise.get("creator_name") or "Someone"
-    intro = f"{sender} left this for you. 💌"
+    intro = MARGOT["deliver_intro"].format(sender_name=sender)
 
     if media_type == "text":
         await bot.send_message(chat_id, f"{intro}\n\n{surprise['text_content']}")
@@ -756,9 +1007,14 @@ async def forward_reaction(
 ):
     if reactor_name and surprise_dt:
         dt_str = friendly_datetime(surprise_dt)
-        await bot.send_message(creator_id, f"{reactor_name} reacted to your surprise from {dt_str} 💌")
+        await bot.send_message(
+            creator_id,
+            MARGOT["reaction_forwarded"].format(reactor_name=reactor_name, dt_str=dt_str),
+        )
     else:
-        await bot.send_message(creator_id, "They reacted. I thought you'd want to know.")
+        await bot.send_message(creator_id, MARGOT["reaction_forwarded"].format(
+            reactor_name="They", dt_str="that surprise",
+        ))
 
     if media_type == "text":
         await bot.send_message(creator_id, text_content)
@@ -825,10 +1081,7 @@ async def _handle_successful_payment(telegram_id: int, bot: Bot) -> None:
         release_db(conn)
 
     try:
-        await bot.send_message(
-            telegram_id,
-            "Payment received. Plus is yours. Don't waste it. 🔑",
-        )
+        await bot.send_message(telegram_id, MARGOT["payment_received"])
     except Exception as e:
         logger.error("Failed to notify user %s: %s", telegram_id, e)
 
@@ -836,7 +1089,7 @@ async def _handle_successful_payment(telegram_id: int, bot: Bot) -> None:
         try:
             await bot.send_message(
                 partner["user_id"],
-                f"{user_name} just unlocked Plus. You both have it now. 🔑",
+                MARGOT["partner_upgraded"].format(user_name=user_name),
             )
         except Exception as e:
             logger.error("Failed to notify partner %s: %s", partner["user_id"], e)
@@ -859,15 +1112,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             members = get_pair_members(pair_id, exclude_user=user.id)
             inviter_name = members[0]["first_name"] if members else "someone"
             await update.message.reply_text(
-                f"You've joined {inviter_name}'s Kept. I'm Margot.\n\n"
-                "I hold things here until the right moment. "
-                "Use /load to leave something."
+                MARGOT["join_invite"].format(inviter_name=inviter_name)
             )
             if trial_started:
-                trial_msg = (
-                    "You have 7 days of Plus to explore everything. "
-                    "After that, the surprises stay — only new media uploads require a subscription. 🔑"
-                )
+                trial_msg = MARGOT["trial_start"]
                 await update.message.reply_text(trial_msg)
                 for m in members:
                     try:
@@ -888,13 +1136,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     create_pair(user.id)
-    await update.message.reply_text(
-        "Oh, you found me. Good.\n\n"
-        "I'm Margot. I keep things safe until the moment is right.\n\n"
-        "Use /invite to bring someone into your Kept, "
-        "then /load to leave them something.\n\n"
-        "When your partner joins, you'll both get 7 days of Plus free. 🔑"
-    )
+    await update.message.reply_text(MARGOT["start"])
 
 
 async def cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1098,21 +1340,26 @@ async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if next_one:
             days = next_one["days_until"]
             await update.message.reply_text(
-                f"Not yet. {days} {'day' if days == 1 else 'days'} to go."
+                MARGOT["not_yet"].format(days=days, day_word="day" if days == 1 else "days")
             )
         else:
-            await update.message.reply_text("Nothing here for today.")
+            await update.message.reply_text(MARGOT["nothing_today"])
         return
 
     surprise = surprises[0]
     mark_surprise_opened(surprise["id"])
+    update_user_activity(user.id)
     await deliver_surprise(update.message.chat_id, surprise, context.bot)
+
+    await check_and_fire_milestone(
+        context.bot, surprise["pair_id"], "first_open",
+        random.choice(MARGOT["milestone_first_open"]),
+        [surprise["creator_id"], user.id],
+    )
 
     if is_plus_or_trial(pair):
         context.user_data["awaiting_reaction_for"] = surprise["id"]
-        await update.message.reply_text(
-            "Send me your reaction — emoji, words, a voice note. Or skip with /calendar."
-        )
+        await update.message.reply_text(MARGOT["await_reaction"])
 
 
 async def cmd_react(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1132,9 +1379,7 @@ async def cmd_react(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["awaiting_reaction_for"] = surprise_id
-    await update.message.reply_text(
-        "Send me your reaction — emoji, words, a voice note."
-    )
+    await update.message.reply_text(MARGOT["await_reaction"])
 
 
 async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1152,8 +1397,10 @@ async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         partners = get_pair_members(pair["id"], exclude_user=user.id)
         partner_name = partners[0]["first_name"] if partners else "your partner"
         await update.message.reply_text(
-            f"Nothing waiting for you yet, {user.first_name}.\n"
-            f"I'm sure {partner_name} has something up their sleeve. 💌"
+            MARGOT["calendar_empty"].format(
+                name=user.first_name or "you",
+                partner_name=partner_name,
+            )
         )
         return
 
@@ -1238,7 +1485,7 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if pair["subscription_tier"] == "plus":
-        await update.message.reply_text("You're already on Plus. Margot approves.")
+        await update.message.reply_text(MARGOT["already_plus"])
         return
 
     keyboard = InlineKeyboardMarkup([[
@@ -1549,6 +1796,39 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # DEV ONLY - remove before launch
+async def cmd_testnudge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    sub = context.args[0].lower() if context.args else ""
+
+    pair = get_user_pair(user.id)
+    if not pair:
+        await update.message.reply_text("No pair found.")
+        return
+
+    partners = get_pair_members(pair["id"], exclude_user=user.id)
+    partner_name = partners[0]["first_name"] if partners else "your partner"
+    name = user.first_name or "you"
+
+    if sub == "inactivity":
+        msg = random.choice(MARGOT["inactivity"]).format(name=name, partner_name=partner_name)
+        await update.message.reply_text(msg)
+    elif sub == "first_load":
+        await update.message.reply_text(random.choice(MARGOT["milestone_first_load"]))
+    elif sub == "first_open":
+        await update.message.reply_text(random.choice(MARGOT["milestone_first_open"]))
+    elif sub == "first_reaction":
+        await update.message.reply_text(random.choice(MARGOT["milestone_first_reaction"]))
+    elif sub == "tenth":
+        await update.message.reply_text(random.choice(MARGOT["milestone_tenth"]))
+    elif sub == "monthly":
+        await update.message.reply_text(random.choice(MARGOT["milestone_monthly"]))
+    else:
+        await update.message.reply_text(
+            "Usage: /testnudge inactivity|first_load|first_open|first_reaction|tenth|monthly"
+        )
+
+
+# DEV ONLY - remove before launch
 async def cmd_devhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Dev commands.\n\n"
@@ -1560,6 +1840,12 @@ async def cmd_devhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/testtrial status — show trial state\n"
         "/testopensender — deliver your next loaded surprise now\n"
         "/testopenreceiver — receive your next incoming surprise now\n"
+        "/testnudge inactivity — fire inactivity nudge immediately\n"
+        "/testnudge first_load — fire first load milestone\n"
+        "/testnudge first_open — fire first open milestone\n"
+        "/testnudge first_reaction — fire first reaction milestone\n"
+        "/testnudge tenth — fire tenth surprise milestone\n"
+        "/testnudge monthly — fire monthly milestone\n"
         "/devhelp — show this list\n"
         "/reset — wipe everything and start fresh"
     )
@@ -1734,6 +2020,8 @@ async def _handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
         replace_existing=True,
     )
 
+    update_user_activity(user.id)
+
     context.user_data.pop("awaiting_content", None)
     context.user_data.pop("pending_date", None)
     context.user_data.pop("pending_time", None)
@@ -1741,7 +2029,13 @@ async def _handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     dt_str = friendly_datetime(release_dt)
     await msg.reply_text(
-        f"Locked away. {recipient_name} will receive it on {dt_str}. I won't say a word. 🔒"
+        MARGOT["load_confirm"].format(recipient_name=recipient_name, dt_str=dt_str)
+    )
+
+    await check_and_fire_milestone(
+        context.bot, pair["id"], "first_load",
+        random.choice(MARGOT["milestone_first_load"]),
+        [user.id],
     )
 
 
@@ -1760,6 +2054,7 @@ async def _handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     save_reaction(surprise_id, user.id, media_type, file_id, text_content)
+    update_user_activity(user.id)
     context.user_data.pop("awaiting_reaction_for", None)
 
     surprise = get_surprise_by_id(surprise_id)
@@ -1774,7 +2069,14 @@ async def _handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error("Failed to forward reaction to %s: %s", creator_id, e)
 
-    await msg.reply_text("Delivered.")
+    await msg.reply_text(MARGOT["reaction_saved"])
+
+    if surprise:
+        await check_and_fire_milestone(
+            context.bot, surprise["pair_id"], "first_reaction",
+            random.choice(MARGOT["milestone_first_reaction"]),
+            [user.id],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1794,8 +2096,40 @@ async def _deliver_surprise_job(surprise_id: int, bot: Bot):
     try:
         await deliver_surprise(recipient_id, surprise, bot)
         mark_surprise_delivered(surprise_id)
+        update_user_activity(recipient_id)
     except Exception as e:
         logger.error("Failed to deliver surprise %d: %s", surprise_id, e)
+        return
+
+    pair_id = surprise["pair_id"]
+    creator_id = surprise["creator_id"]
+
+    await check_and_fire_milestone(
+        bot, pair_id, "first_open",
+        random.choice(MARGOT["milestone_first_open"]),
+        [creator_id, recipient_id],
+    )
+
+    delivered_count = get_pair_delivered_count(pair_id)
+    if delivered_count > 0 and delivered_count % 10 == 0:
+        milestone_key = f"tenth_{delivered_count}"
+        members = get_pair_members(pair_id)
+        await check_and_fire_milestone(
+            bot, pair_id, milestone_key,
+            random.choice(MARGOT["milestone_tenth"]),
+            [m["user_id"] for m in members],
+        )
+
+    first_date = get_pair_first_surprise_date(pair_id)
+    if first_date:
+        today = date.today()
+        if today == one_month_after(first_date):
+            members = get_pair_members(pair_id)
+            await check_and_fire_milestone(
+                bot, pair_id, "monthly_1",
+                random.choice(MARGOT["milestone_monthly"]),
+                [m["user_id"] for m in members],
+            )
 
 
 async def _auto_dismiss_overdue(surprise_id: int):
@@ -1844,9 +2178,9 @@ async def _reschedule_on_startup(bot: Bot):
         try:
             await bot.send_message(
                 s["creator_id"],
-                f"Something I was holding for {recipient_name} was meant to arrive on "
-                f"{due_str} but I wasn't able to deliver it in time.\n\n"
-                "What would you like me to do?",
+                MARGOT["overdue_notification"].format(
+                    recipient_name=recipient_name, due_str=due_str
+                ),
                 reply_markup=keyboard,
             )
             _scheduler.add_job(
@@ -1861,6 +2195,78 @@ async def _reschedule_on_startup(bot: Bot):
                 "Failed to notify sender %s about overdue surprise %d: %s",
                 s["creator_id"], s["id"], e,
             )
+
+
+async def _check_inactivity_nudges(bot: Bot):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT u.user_id, u.first_name, u.consecutive_nudges
+                FROM users u
+                JOIN pair_members pm ON pm.user_id = u.user_id
+                WHERE u.user_id > 0
+                  AND u.created_at < NOW() - INTERVAL '7 days'
+                  AND COALESCE(u.consecutive_nudges, 0) < 2
+                  AND (u.last_nudge_sent_at IS NULL OR u.last_nudge_sent_at < NOW() - INTERVAL '7 days')
+                """
+            )
+            candidates = cur.fetchall()
+    finally:
+        release_db(conn)
+
+    for user_row in candidates:
+        user_id = user_row["user_id"]
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM surprises WHERE creator_id = %s AND created_at > NOW() - INTERVAL '7 days'",
+                    (user_id,),
+                )
+                if cur.fetchone()["cnt"] > 0:
+                    continue
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM surprises WHERE recipient_id = %s AND opened_at > NOW() - INTERVAL '7 days'",
+                    (user_id,),
+                )
+                if cur.fetchone()["cnt"] > 0:
+                    continue
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM reactions WHERE reactor_id = %s AND created_at > NOW() - INTERVAL '7 days'",
+                    (user_id,),
+                )
+                if cur.fetchone()["cnt"] > 0:
+                    continue
+        finally:
+            release_db(conn)
+
+        pair = get_user_pair(user_id)
+        if not pair:
+            continue
+        partners = get_pair_members(pair["id"], exclude_user=user_id)
+        if not partners:
+            continue
+
+        partner_name = partners[0]["first_name"] or "them"
+        name = user_row["first_name"] or "you"
+        msg = random.choice(MARGOT["inactivity"]).format(name=name, partner_name=partner_name)
+
+        try:
+            await send_proactive(bot, user_id, msg)
+            update_nudge_sent(user_id)
+        except Exception as e:
+            logger.error("Failed to send nudge to %d: %s", user_id, e)
+
+
+async def _flush_proactive_queue(bot: Bot):
+    queued = flush_proactive_queue()
+    for item in queued:
+        try:
+            await bot.send_message(item["user_id"], item["message"])
+        except Exception as e:
+            logger.error("Failed to flush queued message to %d: %s", item["user_id"], e)
 
 
 async def _check_expired_trials(bot: Bot):
@@ -1901,8 +2307,7 @@ async def _check_expired_trials(bot: Bot):
                 ]])
                 await bot.send_message(
                     m["user_id"],
-                    "Your Plus trial has ended. Everything you loaded is still here — "
-                    "only new media uploads require a subscription.",
+                    MARGOT["trial_expired"],
                     reply_markup=keyboard,
                 )
             except Exception as e:
@@ -1931,6 +2336,7 @@ def _build_tg_app() -> Application:
     app.add_handler(CommandHandler("testclearinvites", cmd_testclearinvites, filters=_dev))  # DEV ONLY
     app.add_handler(CommandHandler("testopensender", cmd_testopensender, filters=_dev))  # DEV ONLY
     app.add_handler(CommandHandler("testopenreceiver", cmd_testopenreceiver, filters=_dev))  # DEV ONLY
+    app.add_handler(CommandHandler("testnudge", cmd_testnudge, filters=_dev))  # DEV ONLY
     app.add_handler(CommandHandler("devhelp", cmd_devhelp, filters=_dev))  # DEV ONLY
     app.add_handler(CommandHandler("reset", cmd_reset, filters=_dev))  # DEV ONLY
     app.add_handler(CommandHandler("help", cmd_help))
@@ -1964,6 +2370,8 @@ async def _run() -> None:
     # Scheduler — Prague timezone so naive run_dates are treated as local time
     _scheduler = AsyncIOScheduler(timezone="Europe/Prague")
     _scheduler.add_job(_check_expired_trials, "cron", hour=9, minute=0, args=[tg_app.bot])
+    _scheduler.add_job(_check_inactivity_nudges, "cron", hour=10, minute=0, args=[tg_app.bot])
+    _scheduler.add_job(_flush_proactive_queue, "cron", hour=8, minute=0, args=[tg_app.bot])
     _scheduler.start()
 
     # Register BotFather commands
