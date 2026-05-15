@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 import aiohttp.web
 import psycopg2
+import psycopg2.extensions
 import psycopg2.extras
 import psycopg2.pool
 import stripe
@@ -128,11 +129,48 @@ def _init_pool() -> None:
     )
 
 
+def _reset_pool() -> None:
+    global _pool
+    try:
+        if _pool:
+            _pool.closeall()
+    except Exception:
+        pass
+    _pool = psycopg2.pool.SimpleConnectionPool(
+        minconn=1,
+        maxconn=10,
+        dsn=DATABASE_URL,
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    )
+    logger.info("Connection pool reinitialised")
+
+
 def get_db():
-    return _pool.getconn()
+    for attempt in range(2):
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            return conn
+        except (psycopg2.InterfaceError, psycopg2.OperationalError):
+            logger.warning("Stale connection detected (attempt %d), reinitialising pool", attempt + 1)
+            try:
+                _pool.putconn(conn, close=True)
+            except Exception:
+                pass
+            if attempt == 0:
+                _reset_pool()
+    raise psycopg2.OperationalError("Could not obtain a valid database connection")
 
 
 def release_db(conn) -> None:
+    # Roll back any aborted transaction before returning the connection to the pool.
+    # Without this, a connection left in an error state poisons the next caller.
+    try:
+        if conn.status != psycopg2.extensions.STATUS_READY:
+            conn.rollback()
+    except Exception:
+        pass
     _pool.putconn(conn)
 
 
@@ -1842,6 +1880,10 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.info("reset: %s row count = %d", tbl, cnt)
     finally:
         release_db(conn)
+
+    # Discard all pooled connections — they held references to the now-deleted rows.
+    # Fresh connections are issued on the next command.
+    _reset_pool()
 
     await update.message.reply_text("Done. Everything is gone. Start over with /start.")
 
