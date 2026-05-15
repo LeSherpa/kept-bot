@@ -1438,11 +1438,11 @@ async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for s in surprises:
         d = s["scheduled_date"]
-        label = escape_md(_format_surprise_label(s))
         if s["is_opened"] or d <= today:
+            label = escape_md(_format_surprise_label(s))
             lines.append(f"✅ {label}")
         else:
-            lines.append(f"||{label}||")
+            lines.append(escape_md("🔒 I'm holding something for you. That's all I'll say. 💌"))
 
     await update.message.reply_text(
         "\n".join(lines),
@@ -1598,6 +1598,14 @@ async def cmd_testinvite(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     """,
                     (pair["id"], fake_id, surprise_date, release_dt, fake_text, user.id),
                 )
+        # Start the Plus trial if not already running (same as real invite join)
+        cur.execute(
+            """
+            UPDATE pairs SET trial_started_at = NOW()
+            WHERE id = %s AND trial_started_at IS NULL
+            """,
+            (pair["id"],),
+        )
         conn.commit()
     finally:
         release_db(conn)
@@ -1610,7 +1618,7 @@ async def cmd_testinvite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     label = "fake member" if count == 1 else "fake members"
     await update.message.reply_text(
-        f"Done. Added {count} {label} — {names}.\nEach left something for you. Check your calendar. 🔑"
+        f"Done. Added {count} {label} — {names}.\nEach left something for you. Check your calendar. 7-day Plus trial started. 🔑"
     )
 
 
