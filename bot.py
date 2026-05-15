@@ -87,6 +87,7 @@ MARGOT = {
     "not_yet": "Not yet. {days} {day_word} to go.",
     "nothing_today": "Nothing here for today.",
     "await_reaction": "Send me your reaction — emoji, words, a voice note. Or skip with /calendar.",
+    "react_prompt": "Want to send something back? Use /react. 💌",
     "inactivity": [
         "It's been a while since I kept a surprise for {partner_name}. Any ideas? 💅",
         "{partner_name}'s calendar is looking empty on my end. Just saying. 💅",
@@ -1424,9 +1425,9 @@ async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [surprise["creator_id"], user.id],
     )
 
+    await update.message.reply_text(MARGOT["react_prompt"])
     if is_plus_or_trial(pair):
         context.user_data["awaiting_reaction_for"] = surprise["id"]
-        await update.message.reply_text(MARGOT["await_reaction"])
 
 
 async def cmd_react(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1844,6 +1845,7 @@ async def cmd_testopenreceiver(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         mark_surprise_opened(surprise["id"])
         await deliver_surprise(update.message.chat_id, surprise, context.bot)
+        await update.message.reply_text(MARGOT["react_prompt"])
     except Exception as e:
         logger.error("testopenreceiver error:\n%s", traceback.format_exc())
         await update.message.reply_text(f"Dev error: {e}")
@@ -2190,6 +2192,7 @@ async def _deliver_surprise_job(surprise_id: int, bot: Bot):
         await deliver_surprise(recipient_id, surprise, bot)
         mark_surprise_delivered(surprise_id)
         update_user_activity(recipient_id)
+        await bot.send_message(recipient_id, MARGOT["react_prompt"])
     except Exception as e:
         logger.error("Failed to deliver surprise %d: %s", surprise_id, e)
         return
