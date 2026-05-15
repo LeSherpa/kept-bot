@@ -1636,14 +1636,14 @@ async def cmd_testinvite(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     """,
                     (pair["id"], fake_id, surprise_date, release_dt, fake_text, user.id),
                 )
-        # Start the Plus trial if not already running (same as real invite join)
-        cur.execute(
-            """
-            UPDATE pairs SET trial_started_at = NOW()
-            WHERE id = %s AND trial_started_at IS NULL
-            """,
-            (pair["id"],),
-        )
+            # Start the Plus trial if not already running (same as real invite join)
+            cur.execute(
+                """
+                UPDATE pairs SET trial_started_at = NOW()
+                WHERE id = %s AND trial_started_at IS NULL
+                """,
+                (pair["id"],),
+            )
         conn.commit()
     finally:
         release_db(conn)
@@ -2489,6 +2489,10 @@ async def _run() -> None:
             loop.add_signal_handler(sig, stop.set)
 
     async with tg_app:
+        # Clear any webhook and give the previous instance time to exit cleanly
+        # before this one starts polling — prevents duplicate message delivery.
+        await tg_app.bot.delete_webhook(drop_pending_updates=True)
+        await asyncio.sleep(3)
         await tg_app.start()
         await _reschedule_on_startup(tg_app.bot)
         await tg_app.updater.start_polling(drop_pending_updates=True)
