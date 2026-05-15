@@ -86,7 +86,7 @@ MARGOT = {
     ),
     "not_yet": "Not yet. {days} {day_word} to go.",
     "nothing_today": "Nothing here for today.",
-    "await_reaction": "Send me your reaction — emoji, words, a voice note. Or skip with /calendar.",
+    "await_reaction": "Send me your reaction — text, photo, audio, video or a sticker. 💌",
     "react_prompt": "Want to send something back? Use /react. 💌",
     "inactivity": [
         "It's been a while since I kept a surprise for {partner_name}. Any ideas? 💅",
@@ -1062,6 +1062,9 @@ async def deliver_surprise(chat_id: int, surprise, bot: Bot):
     elif media_type == "video_note":
         await bot.send_message(chat_id, intro)
         await bot.send_video_note(chat_id, file_id)
+    elif media_type == "sticker":
+        await bot.send_message(chat_id, intro)
+        await bot.send_sticker(chat_id, file_id)
 
 
 async def forward_reaction(
@@ -1096,6 +1099,8 @@ async def forward_reaction(
         await bot.send_video(creator_id, file_id)
     elif media_type == "video_note":
         await bot.send_video_note(creator_id, file_id)
+    elif media_type == "sticker":
+        await bot.send_sticker(creator_id, file_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1357,7 +1362,7 @@ async def recipient_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     recipient_id = int(query.data.split("_", 1)[1])
     context.user_data["pending_recipient_id"] = recipient_id
     context.user_data["awaiting_content"] = True
-    await query.edit_message_text("Good choice. Now send me what you want to leave.")
+    await query.edit_message_text("Good choice. Now send me what you want to leave — text, photo, audio, video or a sticker.")
 
 
 async def overdue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1496,6 +1501,7 @@ _MEDIA_LABEL = {
     "voice": "voice note",
     "video": "video",
     "video_note": "video note",
+    "sticker": "sticker",
 }
 
 
@@ -1989,6 +1995,8 @@ def _extract_media(msg):
         return "video", msg.video.file_id
     if msg.video_note:
         return "video_note", msg.video_note.file_id
+    if msg.sticker:
+        return "sticker", msg.sticker.file_id
     return None, None
 
 
@@ -2047,7 +2055,7 @@ async def _handle_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if len(others) == 1:
         context.user_data["pending_recipient_id"] = others[0]["user_id"]
         context.user_data["awaiting_content"] = True
-        await msg.reply_text("Good choice. Now send me what you want to leave.")
+        await msg.reply_text("Good choice. Now send me what you want to leave — text, photo, audio, video or a sticker.")
     else:
         buttons = [
             [InlineKeyboardButton(m["first_name"], callback_data=f"recipient_{m['user_id']}")]
@@ -2085,11 +2093,11 @@ async def _handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_plus:
             await msg.reply_text(
                 "That's a Plus feature. Upgrade with /subscribe "
-                "to unlock photos, audio and video."
+                "to unlock photos, audio, video and stickers."
             )
             return
     else:
-        await msg.reply_text("I can hold text, photos, audio or video.")
+        await msg.reply_text("I can hold text, photos, audio, video or a sticker.")
         return
 
     recipient_id = context.user_data.get("pending_recipient_id")
@@ -2443,7 +2451,7 @@ def _build_tg_app() -> Application:
     app.add_handler(CallbackQueryHandler(overdue_callback, pattern=r"^overdue_"))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.AUDIO | filters.VOICE |
-         filters.VIDEO | filters.VIDEO_NOTE) & ~filters.COMMAND,
+         filters.VIDEO | filters.VIDEO_NOTE | filters.Sticker.ALL) & ~filters.COMMAND,
         handle_incoming_message,
     ))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
