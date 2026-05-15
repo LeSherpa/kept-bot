@@ -1805,21 +1805,35 @@ async def cmd_testopenreceiver(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # DEV ONLY - remove before launch
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Cancel every scheduled job first so no surprise fires after wipe
+    _scheduler.remove_all_jobs()
+
+    tables = [
+        "reactions",       # refs surprises, users
+        "proactive_queue", # refs users
+        "milestones",      # refs pairs
+        "surprises",       # refs pairs, users
+        "invites",         # refs pairs, users
+        "pair_members",    # refs pairs, users
+        "pairs",
+        "users",
+    ]
+
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM reactions")
-            cur.execute("DELETE FROM surprises")
-            cur.execute("DELETE FROM invites")
-            cur.execute("DELETE FROM pair_members")
-            cur.execute("DELETE FROM pairs")
-            cur.execute("DELETE FROM users")
+            for tbl in tables:
+                cur.execute(f"DELETE FROM {tbl}")
         conn.commit()
+
+        # Verify — log row count for each table (should all be 0)
+        with conn.cursor() as cur:
+            for tbl in tables:
+                cur.execute(f"SELECT COUNT(*) AS cnt FROM {tbl}")
+                cnt = cur.fetchone()["cnt"]
+                logger.info("reset: %s row count = %d", tbl, cnt)
     finally:
         release_db(conn)
-
-    for job in _scheduler.get_jobs():
-        job.remove()
 
     await update.message.reply_text("Done. Everything is gone. Start over with /start.")
 
