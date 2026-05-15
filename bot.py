@@ -946,23 +946,52 @@ def escape_md(text: str) -> str:
 
 
 def parse_time_input(text: str) -> tuple[int, int] | None:
-    text = text.strip()
-    m = re.fullmatch(r'(\d{1,2})[:\.](\d{2})', text)
+    # Collapse all whitespace: "1 PM", "1 : 30", "1h30 PM" → "1PM", "1:30", "1h30PM"
+    text = re.sub(r'\s+', '', text.strip())
+    if not text:
+        return None
+
+    # 1 — 12h: 1PM, 1:00PM, 1,00PM, 1h00PM, 12:30pm, 1,30pm, 1h30am …
+    m = re.fullmatch(r'(\d{1,2})(?:[,:](\d{2})|h(\d{2}))?(am|pm)', text, re.IGNORECASE)
+    if m:
+        orig_h = int(m.group(1))
+        mn_str = m.group(2) or m.group(3)
+        mn = int(mn_str) if mn_str else 0
+        ampm = m.group(4).upper()
+        h = orig_h
+        if ampm == 'PM' and h != 12:
+            h += 12
+        elif ampm == 'AM' and h == 12:
+            h = 0
+        if 1 <= orig_h <= 12 and 0 <= mn <= 59:
+            return h, mn
+        return None
+
+    # 2 — 24h colon or comma: 13:00, 13,30, 9:00, 09:00
+    m = re.fullmatch(r'(\d{1,2})[,:](\d{2})', text)
     if m:
         h, mn = int(m.group(1)), int(m.group(2))
         if 0 <= h <= 23 and 0 <= mn <= 59:
             return h, mn
-    m = re.fullmatch(r'(\d{1,2})(?:[:\.](\d{2}))?\s*(AM|PM)', text, re.IGNORECASE)
+        return None
+
+    # 3 — 24h h-suffix: 13h, 13h00, 13h30, 9h, 09h
+    m = re.fullmatch(r'(\d{1,2})h(\d{2})?', text, re.IGNORECASE)
     if m:
         h = int(m.group(1))
         mn = int(m.group(2)) if m.group(2) else 0
-        ampm = m.group(3).upper()
-        if ampm == "PM" and h != 12:
-            h += 12
-        elif ampm == "AM" and h == 12:
-            h = 0
         if 0 <= h <= 23 and 0 <= mn <= 59:
             return h, mn
+        return None
+
+    # 4 — 4-digit bare: 1300, 1330, 0930
+    m = re.fullmatch(r'(\d{2})(\d{2})', text)
+    if m:
+        h, mn = int(m.group(1)), int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mn <= 59:
+            return h, mn
+        return None
+
     return None
 
 
@@ -1921,7 +1950,7 @@ async def _handle_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if parsed is None:
         await msg.reply_text(
-            "I didn't catch that. Reply with a time like 14:30 or 2:30 PM.",
+            "I didn't catch that. Reply with a time like 14:30, 2:30 PM, 14h30 or 2,30 PM.",
             reply_markup=back_button,
         )
         return
